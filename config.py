@@ -40,6 +40,13 @@ SNOWFLAKE_TABLES = {
     'enterprise_value': 'ENTERPRISEVALUE_HISTORY'
 }
 
+# Exposure pipeline settings
+EXPOSURE_PIPELINE = {
+    'max_workers': None,          # Default: auto-detect (CPU cores - 1)
+    'window_cache_size': 64,      # Rolling window cache size for per-date slices
+    'progress_interval': 25       # How frequently to print progress updates
+}
+
 # Factor Construction Parameters (MSCI-style)
 FACTOR_PARAMS = {
     'momentum_lookback': 252,  # 12 months (252 trading days)

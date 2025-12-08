@@ -8,6 +8,7 @@ from typing import Optional, Dict, List
 from datetime import datetime, timedelta
 import config
 import os
+from tqdm import tqdm
 
 
 # Note: load_ticker_list function removed - we now use all stocks in the universe
@@ -49,12 +50,14 @@ class SnowflakeDataRetriever:
             self.conn.close()
             print("Disconnected from Snowflake")
     
-    def execute_query(self, query: str) -> pd.DataFrame:
+    def execute_query(self, query: str, desc: str = None) -> pd.DataFrame:
         """
         Execute SQL query and return results as DataFrame
+        Uses fetch_pandas_all() for faster performance on large result sets
         
         Args:
             query: SQL query string
+            desc: Optional description for progress bar
             
         Returns:
             DataFrame with query results
@@ -65,13 +68,22 @@ class SnowflakeDataRetriever:
         try:
             cursor = self.conn.cursor()
             cursor.execute(query)
-            results = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            df = pd.DataFrame(results, columns=columns)
+            
+            # Use fetch_pandas_all() for much faster data loading (direct to DataFrame)
+            # This is significantly faster than fetchall() + DataFrame constructor
+            try:
+                df = cursor.fetch_pandas_all()
+            except (AttributeError, Exception):
+                # Fallback for older snowflake-connector versions or if method not available
+                results = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                df = pd.DataFrame(results, columns=columns)
+            
             cursor.close()
             return df
         except Exception as e:
-            raise RuntimeError(f"Query execution failed: {str(e)}")
+            query_preview = query[:200] + "..." if len(query) > 200 else query
+            raise RuntimeError(f"Query execution failed: {str(e)}\nQuery preview: {query_preview}")
     
     def get_stock_data(self, 
                       tickers: List[str],
@@ -161,13 +173,10 @@ class SnowflakeDataRetriever:
         # Handle large factset_id lists by chunking the query
         if factset_ids and len(factset_ids) > 1000:
             # For very large lists, process in chunks to avoid query size limits
-            print(f"  Processing {len(factset_ids)} stocks in chunks of 1000...")
             chunks = [factset_ids[i:i+1000] for i in range(0, len(factset_ids), 1000)]
             all_results = []
             
-            for i, chunk in enumerate(chunks):
-                if (i + 1) % 10 == 0:
-                    print(f"    Processed {i+1}/{len(chunks)} chunks...")
+            for chunk in tqdm(chunks, desc=f"Loading fundamentals (chunks of 1000)", unit="chunk"):
                 factset_list = "', '".join(chunk)
                 factset_filter = f"AND FACTSET_ID IN ('{factset_list}')"
                 
@@ -311,13 +320,10 @@ class SnowflakeDataRetriever:
         
         # Handle large factset_id lists by chunking the query
         if factset_ids and len(factset_ids) > 1000:
-            print(f"  Processing {len(factset_ids)} stocks in chunks of 1000...")
             chunks = [factset_ids[i:i+1000] for i in range(0, len(factset_ids), 1000)]
             all_results = []
             
-            for i, chunk in enumerate(chunks):
-                if (i + 1) % 10 == 0:
-                    print(f"    Processed {i+1}/{len(chunks)} chunks...")
+            for chunk in tqdm(chunks, desc=f"Loading prices (chunks of 1000)", unit="chunk"):
                 factset_list = "', '".join(chunk)
                 factset_filter = f"AND FACTSET_ID IN ('{factset_list}')"
                 
@@ -399,6 +405,7 @@ class SnowflakeDataRetriever:
         
         table_name = f'"{config.SNOWFLAKE_CONFIG["database"]}"."{config.SNOWFLAKE_CONFIG["schema"]}".{config.SNOWFLAKE_TABLES["fundamentals"]}'
         
+        # Add query hint for better performance
         query = f"""
         SELECT 
             FACTSET_ID,
@@ -416,6 +423,7 @@ class SnowflakeDataRetriever:
         ORDER BY DATE, FACTSET_ID
         """
         
+        print(f"   Executing query (this may take a few minutes for large date ranges)...")
         return self.execute_query(query)
     
     def get_prices_data_by_date_range(self, start_date: str, end_date: str) -> pd.DataFrame:
@@ -478,45 +486,63 @@ class SnowflakeDataRetriever:
         print("[STAGE A] Bulk Loading Raw Data")
         print("=" * 80)
         
-        # Calculate lookback start date (need ~365 days for momentum)
-        # We'll use '2019-04-01' as a safe buffer
-        lookback_start_date = '2019-04-01'
+        # Calculate lookback start date (need ~365 days for momentum calculations)
+        # Use 1 year before start_date, but ensure minimum date of 2015-01-01
+        start_dt = pd.to_datetime(start_date)
+        lookback_dt = start_dt - timedelta(days=400)  # ~1.1 years buffer for momentum (252+21 days)
+        min_lookback_date = '2015-01-01'
+        lookback_start_date = max(lookback_dt.strftime('%Y-%m-%d'), min_lookback_date)
         
-        print(f"\n1. Loading universe metadata...")
-        universe = self.get_universe_data(bloomberg_tickers=None)
-        if len(universe) == 0:
-            raise ValueError("No universe data found in the database.")
+        print(f"   Modeling period: {start_date} to {end_date}")
+        print(f"   Data loading from: {lookback_start_date} (for historical lookback)")
         
-        # Add CONTINENT column if COUNTRY exists
-        if 'COUNTRY' in universe.columns:
-            from continent_mapping import get_continent
-            universe['CONTINENT'] = universe['COUNTRY'].apply(get_continent)
+        # Step 1: Load universe metadata
+        print(f"\n[1/4] Loading universe metadata...")
+        with tqdm(total=1, desc="Universe", bar_format='{desc}: {elapsed}') as pbar:
+            universe = self.get_universe_data(bloomberg_tickers=None)
+            if len(universe) == 0:
+                raise ValueError("No universe data found in the database.")
+            
+            # Add CONTINENT column if COUNTRY exists
+            if 'COUNTRY' in universe.columns:
+                from continent_mapping import get_continent
+                universe['CONTINENT'] = universe['COUNTRY'].apply(get_continent)
+            pbar.update(1)
         
-        print(f"   ✓ Universe: {len(universe)} stocks")
-        
-        # Get FACTSET_IDs for filtering (optional, for smaller queries)
         factset_ids = universe['FACTSET_ID'].unique().tolist()
-        print(f"   ✓ Total stocks: {len(factset_ids)}")
+        print(f"   ✓ Universe: {len(universe):,} stocks, {len(factset_ids):,} unique FACTSET_IDs")
         
-        print(f"\n2. Loading fundamentals data ({lookback_start_date} to {end_date})...")
-        fundamentals = self.get_fundamentals_data_by_date_range(
-            start_date=lookback_start_date,
-            end_date=end_date
-        )
+        # Step 2: Load fundamentals
+        print(f"\n[2/4] Loading fundamentals data ({lookback_start_date} to {end_date})...")
+        print("   This may take several minutes for large datasets...")
+        with tqdm(total=1, desc="Fundamentals", bar_format='{desc}: {elapsed}') as pbar:
+            fundamentals = self.get_fundamentals_data_by_date_range(
+                start_date=lookback_start_date,
+                end_date=end_date
+            )
+            pbar.update(1)
         print(f"   ✓ Fundamentals: {len(fundamentals):,} rows")
         
-        print(f"\n3. Loading prices data ({lookback_start_date} to {end_date})...")
-        prices = self.get_prices_data_by_date_range(
-            start_date=lookback_start_date,
-            end_date=end_date
-        )
+        # Step 3: Load prices
+        print(f"\n[3/4] Loading prices data ({lookback_start_date} to {end_date})...")
+        print("   This may take several minutes for large datasets...")
+        with tqdm(total=1, desc="Prices", bar_format='{desc}: {elapsed}') as pbar:
+            prices = self.get_prices_data_by_date_range(
+                start_date=lookback_start_date,
+                end_date=end_date
+            )
+            pbar.update(1)
         print(f"   ✓ Prices: {len(prices):,} rows")
         
-        print(f"\n4. Calculating returns from prices...")
-        returns = self.calculate_returns_from_prices(prices)
+        # Step 4: Calculate returns
+        print(f"\n[4/4] Calculating returns from prices...")
+        with tqdm(total=1, desc="Returns", bar_format='{desc}: {elapsed}') as pbar:
+            returns = self.calculate_returns_from_prices(prices)
+            pbar.update(1)
         print(f"   ✓ Returns: {len(returns):,} rows")
         
         # Ensure DATE columns are datetime
+        print(f"\n   Converting date columns to datetime format...")
         for df_name, df in [('fundamentals', fundamentals), ('prices', prices)]:
             if 'DATE' in df.columns:
                 df['DATE'] = pd.to_datetime(df['DATE'])
@@ -524,7 +550,9 @@ class SnowflakeDataRetriever:
         if 'P_DATE' in returns.columns:
             returns['P_DATE'] = pd.to_datetime(returns['P_DATE'])
         
-        print("\n✓ Bulk data loading complete!")
+        print("\n" + "=" * 80)
+        print("✓ Bulk data loading complete!")
+        print("=" * 80)
         
         return {
             'universe': universe,

@@ -1,165 +1,134 @@
-# EDS Factor Model - MSCI-Styled Factor Model
+# EDS Factor Model
 
-A comprehensive factor model system that constructs, tests, and optimizes factors to achieve high correlation with S&P500 returns.
+Streamlined factor model workflow that downloads all data upfront to **local Parquet files**, then processes quarters in parallel for speed. **No Snowflake queries after initial download!**
 
-## Overview
-
-This project implements an MSCI-styled factor model that:
-1. Retrieves data from Snowflake
-2. Constructs multiple factors (momentum, value, quality, size, volatility, reversal)
-3. Tests factor effectiveness using Information Coefficient (IC) and quantile analysis
-4. Builds an optimized factor model targeting >70% correlation with S&P500 returns
-
-## Project Structure
-
-```
-EDS_factor_model/
-├── factors.py              # Main workflow script
-├── config.py               # Configuration settings
-├── data_retrieval.py       # Snowflake data retrieval module
-├── factor_construction.py  # Factor construction logic
-├── factor_testing.py       # Factor testing and validation
-├── model_builder.py        # Factor model optimization
-├── requirements.txt        # Python dependencies
-├── .env.example           # Example environment variables
-└── README.md              # This file
-```
-
-## Setup
+## Quick Start
 
 ### 1. Install Dependencies
 
 ```bash
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
 ### 2. Configure Snowflake Connection
 
-Create a `.env` file in the project root (copy from `.env.example`):
-
-```bash
-cp .env.example .env
+Create `.env` file with your Snowflake credentials:
+```
+SNOWFLAKE_ACCOUNT=your_account
+SNOWFLAKE_USER=your_user
+SNOWFLAKE_PASSWORD=your_password
+SNOWFLAKE_WAREHOUSE=your_warehouse
+SNOWFLAKE_DATABASE=your_database
+SNOWFLAKE_SCHEMA=your_schema
 ```
 
-Edit `.env` with your Snowflake credentials:
-- `SNOWFLAKE_ACCOUNT`: Your Snowflake account identifier
-- `SNOWFLAKE_USER`: Your Snowflake username
-- `SNOWFLAKE_PASSWORD`: Your Snowflake password
-- `SNOWFLAKE_WAREHOUSE`: Your warehouse name
-- `SNOWFLAKE_DATABASE`: Your database name
-- `SNOWFLAKE_SCHEMA`: Your schema name
-- `SNOWFLAKE_ROLE`: Your role (optional)
-
-### 3. Prepare Your Snowflake Data
-
-Your Snowflake database should have two tables:
-
-**Price Table** (`stock_prices`):
-- `ticker` (VARCHAR)
-- `date` (DATE)
-- `open`, `high`, `low`, `close` (NUMERIC)
-- `volume` (NUMERIC)
-- `adj_close` (NUMERIC)
-
-**Fundamental Table** (`stock_fundamentals`):
-- `ticker` (VARCHAR)
-- `date` (DATE)
-- `market_cap` (NUMERIC)
-- `pe_ratio`, `pb_ratio`, `ev_ebitda` (NUMERIC)
-- `roe`, `roa` (NUMERIC)
-- `debt_to_equity` (NUMERIC)
-- `revenue`, `earnings` (NUMERIC)
-
-## Usage
-
-### Basic Workflow
-
-1. **Update the main script** (`factors.py`) with your actual:
-   - Table names
-   - Ticker list (or query to retrieve tickers)
-   - Date ranges
-
-2. **Run the model**:
+### 3. Run the Workflow
 
 ```bash
-python factors.py
+python main.py
 ```
 
-### Customization
+This will:
+1. **Download all data** from Snowflake → save to `data/*.parquet` (one-time, ~30-60 minutes)
+2. **Process quarters in parallel** using local Parquet files (~10 minutes per quarter)
+3. **Calculate factor returns, specific returns, risk, covariance** (~20-30 minutes total)
 
-#### Modify Factor Parameters
+## Workflow Overview
 
-Edit `config.py` to adjust:
-- `FACTOR_PARAMS`: Factor construction parameters
-- `TARGET_CORRELATION`: Target correlation threshold (default: 0.70)
-- `LOOKBACK_PERIOD`: Historical data period (default: 252 days)
+### Stage 1: Bulk Download (One-Time)
+- Downloads prices, returns, fundamentals from Snowflake
+- **Saves to local Parquet files** (`data/prices.parquet`, `data/returns.parquet`, etc.)
+- **Much faster to read than SQLite** for large datasets
+- **One-time operation** - subsequent runs skip this
 
-#### Add Custom Factors
+### Stage 2: Quarter Processing (Local Files Only!)
+- Loads data from Parquet files (fast!)
+- Processes quarters in parallel (uses all CPU cores)
+- Each quarter takes ~10 minutes
+- **No Snowflake queries** - works entirely locally
 
-Extend `FactorConstructor` in `factor_construction.py` to add new factors:
+### Stages 3-6: Factor Calculations
+- Factor returns (cross-sectional OLS)
+- Specific returns (idiosyncratic)
+- Specific risk (60-day rolling window)
+- Factor covariance (60-day rolling window)
+
+## File Structure
+
+- `main.py` - Main entry point
+- `bulk_download.py` - Downloads all data from Snowflake → Parquet files
+- `quarter_processor.py` - Processes quarters in parallel (reads Parquet files, writes CSV)
+- `model_builder.py` - Factor return/risk calculations
+- `ring_buffers.py` - Memory-efficient rolling calculations
+- `data_retrieval.py` - Snowflake connection and queries
+- `config.py` - Configuration parameters
+- `continent_mapping.py` - Continent mapping utility
+
+## Data Storage
+
+### Input Data (Parquet Files - Fast!)
+- `data/prices.parquet` - All price data
+- `data/returns.parquet` - All return data
+- `data/fundamentals.parquet` - All fundamental data
+- `data/universe.parquet` - Universe metadata
+
+### Output (CSV Files)
+All results are stored as CSV files in `results/` directory:
+- `results/exposures.csv` - Factor exposures per stock per date
+- `results/factor_returns.csv` - Daily factor returns
+- `results/specific_returns.csv` - Stock-specific returns
+- `results/specific_risk.csv` - Specific risk metrics (60-day window)
+- `results/factor_covariance.csv` - Factor covariance matrix (60-day window)
+
+## Performance
+
+- **Bulk download**: ~30-60 minutes (one-time)
+- **Parquet file reads**: **10-50x faster than SQLite** for large datasets
+- **Quarter processing**: ~10 minutes per quarter
+- **Factor calculations**: ~20-30 minutes total
+
+For 2025 (4 quarters): ~70-90 minutes total
+
+## Re-running
+
+If you've already downloaded data, set `skip_download=True` in `main.py`:
 
 ```python
-def construct_custom_factor(self) -> pd.DataFrame:
-    # Your custom factor logic
-    pass
+results = main(
+    start_date='2020-01-01',
+    end_date=None,
+    skip_download=True  # Use local Parquet files (no Snowflake!)
+)
 ```
 
-## Factor Model Components
+## Processing Previous Years
 
-### Factors Constructed
+Just change the date range in `main.py`:
 
-1. **Momentum**: Price momentum over 3-month lookback period
-2. **Value**: Composite of PE, PB, and EV/EBITDA ratios
-3. **Quality**: Composite of ROE, ROA, and debt-to-equity
-4. **Size**: Market capitalization (inverse log rank)
-5. **Volatility**: Low volatility factor (inverse of rolling volatility)
-6. **Reversal**: Short-term mean reversion factor
+```python
+results = main(
+    start_date='2024-01-01',
+    end_date='2024-12-31',
+    skip_download=False  # Download new data
+)
+```
 
-### Model Building Methods
+The workflow will automatically:
+- Download data for the new date range
+- Append to existing Parquet files (or create new ones)
+- Process all quarters in parallel
+- Skip already-processed dates
 
-1. **Ridge Regression**: L2 regularization
-2. **Lasso Regression**: L1 regularization with feature selection
-3. **Optimization**: Direct weight optimization to maximize correlation
+## Why Parquet for Input & CSV for Output?
 
-## Output
+**Input (Parquet):**
+- **10-50x faster reads** for large datasets
+- **Columnar storage** - only reads columns you need
+- **Compression** - smaller file sizes
+- **Perfect for analytical workloads** like factor models
 
-The model provides:
-- Factor Information Coefficient (IC) statistics
-- Quantile portfolio returns
-- Factor weights
-- Model correlation with S&P500
-- R² score and other performance metrics
-
-## Target Correlation
-
-The model is optimized to achieve **>70% correlation** with historical S&P500 returns. The target can be adjusted in `config.py`.
-
-## Notes
-
-- The model uses equal-weighted portfolio returns by default. For production use, consider implementing market-cap weighting.
-- Factor construction handles missing data by forward-filling where appropriate.
-- The model includes time-series cross-validation considerations.
-
-## Troubleshooting
-
-### Connection Issues
-- Verify Snowflake credentials in `.env`
-- Check network connectivity and firewall settings
-- Ensure your Snowflake user has appropriate permissions
-
-### Data Issues
-- Verify table names match your Snowflake schema
-- Check date formats and data types
-- Ensure sufficient historical data (minimum 60 data points)
-
-### Model Performance
-- If correlation is below target, try:
-  - Increasing lookback period
-  - Adding more factors
-  - Adjusting regularization parameters
-  - Using optimization method instead of regression
-
-## License
-
-This project is for internal use.
-
+**Output (CSV):**
+- **Universal format** - easy to open in Excel, Python, R, etc.
+- **No database overhead** - simple file-based storage
+- **Easy to share and analyze** - standard format for results

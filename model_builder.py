@@ -455,14 +455,14 @@ class FactorModelBuilder:
         return specific_returns_df
     
     def calculate_factor_covariance(self, factor_returns_df: pd.DataFrame,
-                                    lookback_window: int = 252) -> pd.DataFrame:
+                                    lookback_window: int = 60) -> pd.DataFrame:
         """
         Calculate factor covariance matrix using rolling window
         F_kl = Cov_t(f_k,t, f_l,t)
         
         Args:
             factor_returns_df: DataFrame with factor returns
-            lookback_window: Rolling window size (default: 252 trading days)
+            lookback_window: Rolling window size (default: 60 trading days)
             
         Returns:
             DataFrame with factor covariance matrix
@@ -526,7 +526,11 @@ class FactorModelBuilder:
             epsilon: Floor value for specific variance to avoid negatives (default: 1e-8)
             
         Returns:
-            DataFrame with columns: MODEL, DATE, FACTSET_ID, SPECIFIC_VAR, SPECIFIC_VOL
+            DataFrame with columns: MODEL, DATE, FACTSET_ID, TOTAL_VAR, FACTOR_VAR, SPECIFIC_VAR, SPECIFIC_VOL
+            - TOTAL_VAR: Total variance of stock returns (60-day rolling window)
+            - FACTOR_VAR: Factor variance = β^T * Σ_f * β (using 60-day rolling covariance matrix)
+            - SPECIFIC_VAR: Specific variance = TOTAL_VAR - FACTOR_VAR
+            - SPECIFIC_VOL: Specific volatility = sqrt(SPECIFIC_VAR)
         """
         print(f"  Calculating specific risk with {window}-day rolling window...")
         
@@ -646,8 +650,10 @@ class FactorModelBuilder:
                     'MODEL': 'EDS_MODEL',
                     'DATE': date_T,
                     'FACTSET_ID': factset_id,
-                    'SPECIFIC_VAR': specific_var,
-                    'SPECIFIC_VOL': specific_vol
+                    'TOTAL_VAR': total_var,  # Total variance of returns (60-day rolling)
+                    'FACTOR_VAR': factor_var,  # Factor variance = β^T * Σ_f * β (60-day rolling)
+                    'SPECIFIC_VAR': specific_var,  # Specific variance = TOTAL_VAR - FACTOR_VAR
+                    'SPECIFIC_VOL': specific_vol  # Specific volatility = sqrt(SPECIFIC_VAR)
                 })
         
         specific_risk_df = pd.DataFrame(specific_risk_list)
