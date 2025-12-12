@@ -503,10 +503,10 @@ class SnowflakeDataRetriever:
             if len(universe) == 0:
                 raise ValueError("No universe data found in the database.")
             
-            # Add CONTINENT column if COUNTRY exists
+            # Add CONTINENT column if COUNTRY exists (now includes developed/developing)
             if 'COUNTRY' in universe.columns:
-                from continent_mapping import get_continent
-                universe['CONTINENT'] = universe['COUNTRY'].apply(get_continent)
+                from continent_mapping import get_continent_developed
+                universe['CONTINENT'] = universe['COUNTRY'].apply(get_continent_developed)
             pbar.update(1)
         
         factset_ids = universe['FACTSET_ID'].unique().tolist()

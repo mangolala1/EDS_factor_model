@@ -66,5 +66,8 @@ FACTOR_RETURN_PARAMS = {
     # With sum-to-zero dummies, intercept represents average return
 }
 
+# Model Configuration
+MODEL_NAME = 'EDS_MODEL'  # Model identifier for output tables
+
 
 

@@ -205,10 +205,52 @@ def compute_exposures_for_quarter(
     # Initialize calculator manager for this quarter
     calculator_manager = StockCalculatorManager()
     
-    # OPTIMIZATION: Skip historical buffer population - it's very slow (40k+ stocks * 400 days = millions of updates)
-    # Ring buffers will build up naturally during date processing, just less accurate for first ~60 days
-    # This saves 2-3 minutes per quarter and is acceptable for most use cases
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Skipping historical buffer population (buffers will build during processing)")
+    # Populate historical buffers BEFORE processing dates
+    # This ensures MOMENTUM, VOLATILITY, LIQUIDITY are available from the first date
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Populating historical buffers...")
+    hist_start = time.time()
+    
+    # Get all historical dates (before the quarter start) for buffer population
+    # Use all_prices/all_returns which include the full lookback period
+    quarter_start = pd.to_datetime(start_date)
+    historical_dates = sorted([d for d in all_prices['DATE'].unique() 
+                              if pd.to_datetime(d) < quarter_start])
+    
+    # Process historical dates to populate buffers (only need to go back enough for calculations)
+    # Momentum needs 252+21=273 days, so we need at least that many historical dates
+    # Process in chronological order (oldest to newest) to build buffers correctly
+    if len(historical_dates) > 0:
+        # Only process the last ~300 days of history (enough for momentum calculation)
+        # This is efficient - we don't need to process all 400 days, just enough for calculations
+        historical_dates_to_process = historical_dates[-300:] if len(historical_dates) > 300 else historical_dates
+        
+        hist_processed = 0
+        for hist_date in historical_dates_to_process:
+            hist_returns = all_returns[all_returns['DATE'] == hist_date].copy()
+            hist_prices = all_prices[all_prices['DATE'] == hist_date].copy()
+            
+            if len(hist_returns) > 0 and len(hist_prices) > 0:
+                # Merge and update buffers
+                hist_merged = hist_returns[['FACTSET_ID', 'ONE_DAY_PCT']].merge(
+                    hist_prices[['FACTSET_ID', 'ADJUSTED_PRICE', 'ADJUSTED_VOLUME']],
+                    on='FACTSET_ID',
+                    how='inner'
+                )
+                hist_merged['DOLLAR_VOL'] = hist_merged['ADJUSTED_PRICE'] * hist_merged['ADJUSTED_VOLUME']
+                
+                # Update calculators with historical data
+                for row in hist_merged.itertuples():
+                    calculator_manager.update_stock(
+                        row.FACTSET_ID,
+                        pd.to_datetime(hist_date),
+                        row.ONE_DAY_PCT,
+                        row.DOLLAR_VOL
+                    )
+                hist_processed += 1
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Populated buffers with {hist_processed} historical dates in {time.time() - hist_start:.1f}s")
+    else:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: No historical dates available (buffers will build during processing)")
     
     # OPTIMIZATION: Process all dates and batch write results
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Processing {len(trading_dates)} trading dates...")
@@ -375,8 +417,13 @@ def compute_exposures_for_quarter(
             continent_dummies[col] = continent_dummies[col] - col_mean
         
         # Combine exposures
-        style_factors = df_T[['FACTSET_ID', 'VALUE', 'PROFITABILITY', 'GROWTH', 
-                              'MOMENTUM', 'VOLATILITY', 'LIQUIDITY']].copy()
+        # Ensure MOMENTUM, VOLATILITY, LIQUIDITY are included even if some values are NaN
+        style_factor_cols = ['FACTSET_ID', 'VALUE', 'PROFITABILITY', 'GROWTH']
+        for factor in ['MOMENTUM', 'VOLATILITY', 'LIQUIDITY']:
+            if factor in df_T.columns:
+                style_factor_cols.append(factor)
+        
+        style_factors = df_T[style_factor_cols].copy()
         style_factors = style_factors.set_index('FACTSET_ID')
         sector_dummies.index = df_T['FACTSET_ID'].values
         continent_dummies.index = df_T['FACTSET_ID'].values
@@ -515,8 +562,8 @@ def process_quarters_parallel(
             return {'processed': 0, 'skipped': 0}
     
     if 'COUNTRY' in universe_df.columns:
-        from continent_mapping import get_continent
-        universe_df['CONTINENT'] = universe_df['COUNTRY'].apply(get_continent)
+        from continent_mapping import get_continent_developed
+        universe_df['CONTINENT'] = universe_df['COUNTRY'].apply(get_continent_developed)
     
     print(f"   ✓ Universe: {len(universe_df):,} stocks")
     print(f"   ✓ Prices/Returns/Fundamentals: Loading per-quarter from Parquet (avoids memory issues)")
@@ -573,10 +620,17 @@ def process_quarters_parallel(
         # Sort by DATE, FACTSET_ID
         combined_exposures['DATE'] = pd.to_datetime(combined_exposures['DATE'])
         combined_exposures = combined_exposures.sort_values(['DATE', 'FACTSET_ID'])
-        combined_exposures['DATE'] = combined_exposures['DATE'].dt.strftime('%Y-%m-%d')
-        combined_exposures.to_csv(exposures_csv_path, index=False)
         
-        print(f"   ✓ Combined {len(combined_exposures):,} exposure rows → {exposures_csv_path}")
+        # Convert to long format (MODEL, DATE, SECURITY_ID, FACTOR_NAME, EXPOSURE)
+        from model_builder import FactorModelBuilder
+        combined_exposures_long = FactorModelBuilder.convert_exposures_to_long_format(combined_exposures)
+        
+        # Sort by DATE, SECURITY_ID, FACTOR_NAME
+        combined_exposures_long = combined_exposures_long.sort_values(['DATE', 'SECURITY_ID', 'FACTOR_NAME'])
+        combined_exposures_long['DATE'] = pd.to_datetime(combined_exposures_long['DATE']).dt.strftime('%Y-%m-%d')
+        combined_exposures_long.to_csv(exposures_csv_path, index=False)
+        
+        print(f"   ✓ Combined and converted {len(combined_exposures_long):,} exposure rows (long format) → {exposures_csv_path}")
         
         # Clean up temporary quarter files
         for csv_file in quarter_csv_files:

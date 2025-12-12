@@ -384,6 +384,7 @@ class FactorModelBuilder:
                 # Store factor returns
                 for i, factor_name in enumerate(factor_names_with_intercept):
                     factor_returns_list.append({
+                        'MODEL': config.MODEL_NAME,
                         'DATE': date,
                         'FACTOR_NAME': factor_name,
                         'RETURN': factor_returns[i]
@@ -403,21 +404,57 @@ class FactorModelBuilder:
         ε̂_i,t = r_i,t - Σ(k=1 to K) β_i,k,t * f̂_k,t
         
         Args:
-            exposures_df: DataFrame with factor exposures
+            exposures_df: DataFrame with factor exposures (index: FACTSET_ID or SECURITY_ID, DATE)
             returns_df: DataFrame with stock returns
             factor_returns_df: DataFrame with factor returns
             
         Returns:
-            DataFrame with specific returns (columns: DATE, FACTSET_ID, SPECIFIC_RETURN)
+            DataFrame with specific returns (columns: MODEL, DATE, SECURITY_ID, SPECIFIC_RETURN)
         """
-        # Merge all data
-        merged = exposures_df.reset_index().merge(
-            returns_df.rename(columns={'P_DATE': 'DATE', 'FSYM_ID': 'FACTSET_ID'}),
-            on=['FACTSET_ID', 'DATE'],
-            how='inner'
+        # Reset index and ensure consistent column names
+        exposures_reset = exposures_df.reset_index()
+        
+        # Handle both SECURITY_ID and FACTSET_ID column names
+        if 'SECURITY_ID' in exposures_reset.columns:
+            id_col = 'SECURITY_ID'
+        elif 'FACTSET_ID' in exposures_reset.columns:
+            id_col = 'FACTSET_ID'
+            exposures_reset = exposures_reset.rename(columns={'FACTSET_ID': 'SECURITY_ID'})
+        else:
+            raise ValueError("Exposures DataFrame must have SECURITY_ID or FACTSET_ID column")
+        
+        # Prepare returns_df with consistent column names
+        returns_prep = returns_df.copy()
+        if 'FSYM_ID' in returns_prep.columns:
+            returns_prep = returns_prep.rename(columns={'FSYM_ID': 'SECURITY_ID'})
+        elif 'FACTSET_ID' in returns_prep.columns:
+            returns_prep = returns_prep.rename(columns={'FACTSET_ID': 'SECURITY_ID'})
+        
+        if 'P_DATE' in returns_prep.columns:
+            returns_prep = returns_prep.rename(columns={'P_DATE': 'DATE'})
+        
+        # Ensure DATE columns are datetime
+        exposures_reset['DATE'] = pd.to_datetime(exposures_reset['DATE'])
+        returns_prep['DATE'] = pd.to_datetime(returns_prep['DATE'])
+        
+        # Use LEFT merge to keep all stocks with exposures, then filter to those with returns
+        # This ensures we don't lose stocks that have exposures but might have missing returns
+        merged = exposures_reset.merge(
+            returns_prep[['SECURITY_ID', 'DATE', 'ONE_DAY_PCT']],
+            on=['SECURITY_ID', 'DATE'],
+            how='left'  # Keep all exposures
         )
         
-        factor_names = [col for col in exposures_df.columns]
+        # Filter to only stocks that have returns (can't calculate specific return without return)
+        merged = merged[merged['ONE_DAY_PCT'].notna()]
+        
+        if len(merged) == 0:
+            print("   ⚠ WARNING: No stocks with both exposures and returns found")
+            return pd.DataFrame(columns=['MODEL', 'DATE', 'SECURITY_ID', 'SPECIFIC_RETURN'])
+        
+        # Get factor names (exclude metadata columns)
+        factor_names = [col for col in exposures_reset.columns 
+                       if col not in ['SECURITY_ID', 'DATE', 'MODEL', 'ONE_DAY_PCT']]
         specific_returns_list = []
         
         # Calculate specific returns for each date and stock
@@ -446,8 +483,9 @@ class FactorModelBuilder:
                 specific_return = row['ONE_DAY_PCT'] - explained_return
                 
                 specific_returns_list.append({
+                    'MODEL': config.MODEL_NAME,
                     'DATE': date,
-                    'FACTSET_ID': row['FACTSET_ID'],
+                    'SECURITY_ID': row['SECURITY_ID'],
                     'SPECIFIC_RETURN': specific_return
                 })
         
@@ -494,6 +532,7 @@ class FactorModelBuilder:
             for i, factor1 in enumerate(factor_names):
                 for j, factor2 in enumerate(factor_names[i:], start=i):
                     covariances.append({
+                        'MODEL': config.MODEL_NAME,
                         'DATE': date,
                         'FACTOR_NAME_1': factor1,
                         'FACTOR_NAME_2': factor2,
@@ -536,11 +575,26 @@ class FactorModelBuilder:
         
         # Prepare data
         exposures_reset = exposures_df.reset_index()
+        
+        # Handle both SECURITY_ID and FACTSET_ID column names
+        if 'SECURITY_ID' in exposures_reset.columns:
+            id_col = 'SECURITY_ID'
+        elif 'FACTSET_ID' in exposures_reset.columns:
+            id_col = 'FACTSET_ID'
+            exposures_reset = exposures_reset.rename(columns={'FACTSET_ID': 'SECURITY_ID'})
+        else:
+            raise ValueError("Exposures DataFrame must have SECURITY_ID or FACTSET_ID column")
+        
         exposures_reset['DATE'] = pd.to_datetime(exposures_reset['DATE'])
         
         returns_prep = returns_df.copy()
-        if 'DATE' not in returns_prep.columns and 'P_DATE' in returns_prep.columns:
-            returns_prep = returns_prep.rename(columns={'P_DATE': 'DATE', 'FSYM_ID': 'FACTSET_ID'})
+        if 'FSYM_ID' in returns_prep.columns:
+            returns_prep = returns_prep.rename(columns={'FSYM_ID': 'SECURITY_ID'})
+        elif 'FACTSET_ID' in returns_prep.columns:
+            returns_prep = returns_prep.rename(columns={'FACTSET_ID': 'SECURITY_ID'})
+        
+        if 'P_DATE' in returns_prep.columns:
+            returns_prep = returns_prep.rename(columns={'P_DATE': 'DATE'})
         returns_prep['DATE'] = pd.to_datetime(returns_prep['DATE'])
         
         factor_returns_prep = factor_returns_df.copy()
@@ -597,11 +651,11 @@ class FactorModelBuilder:
             
             # 2. For each stock, calculate total variance and factor variance
             for _, stock_row in exposures_T.iterrows():
-                factset_id = stock_row['FACTSET_ID']
+                security_id = stock_row['SECURITY_ID']
                 
                 # Get stock returns window: T-59 to T
                 stock_returns_window = returns_prep[
-                    (returns_prep['FACTSET_ID'] == factset_id) &
+                    (returns_prep['SECURITY_ID'] == security_id) &
                     (returns_prep['DATE'] <= date_T) &
                     (returns_prep['DATE'] >= factor_returns_window.index[0])
                 ]['ONE_DAY_PCT'].dropna()
@@ -647,9 +701,9 @@ class FactorModelBuilder:
                 specific_vol = np.sqrt(specific_var)
                 
                 specific_risk_list.append({
-                    'MODEL': 'EDS_MODEL',
+                    'MODEL': config.MODEL_NAME,
                     'DATE': date_T,
-                    'FACTSET_ID': factset_id,
+                    'SECURITY_ID': security_id,
                     'TOTAL_VAR': total_var,  # Total variance of returns (60-day rolling)
                     'FACTOR_VAR': factor_var,  # Factor variance = β^T * Σ_f * β (60-day rolling)
                     'SPECIFIC_VAR': specific_var,  # Specific variance = TOTAL_VAR - FACTOR_VAR
@@ -661,8 +715,8 @@ class FactorModelBuilder:
         if len(specific_risk_df) > 0:
             # Ensure DATE is datetime
             specific_risk_df['DATE'] = pd.to_datetime(specific_risk_df['DATE'])
-            # Sort by DATE and FACTSET_ID
-            specific_risk_df = specific_risk_df.sort_values(['DATE', 'FACTSET_ID'])
+            # Sort by DATE and SECURITY_ID
+            specific_risk_df = specific_risk_df.sort_values(['DATE', 'SECURITY_ID'])
         
         return specific_risk_df
     
@@ -721,6 +775,115 @@ class FactorModelBuilder:
             }
         
         return comparisons
+    
+    def create_factor_names_table(self, exposures_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Create factor names metadata table with display names and factor groups
+        
+        Args:
+            exposures_df: DataFrame with factor exposures (to extract factor names)
+            
+        Returns:
+            DataFrame with columns: MODEL, FACTOR_DISPLAY_NAME, FACTOR_GROUP
+        """
+        factor_names_list = []
+        
+        # Get all factor names from exposures (exclude non-factor columns)
+        exclude_cols = ['FACTSET_ID', 'DATE', 'MODEL', 'SECURITY_ID']
+        factor_names = [col for col in exposures_df.columns if col not in exclude_cols]
+        
+        # Style factors
+        style_factors = ['VALUE', 'PROFITABILITY', 'GROWTH', 'MOMENTUM', 'VOLATILITY', 'LIQUIDITY']
+        for factor in style_factors:
+            if factor in factor_names:
+                factor_names_list.append({
+                    'MODEL': config.MODEL_NAME,
+                    'FACTOR_DISPLAY_NAME': factor,
+                    'FACTOR_GROUP': 'Style Factors'
+                })
+        
+        # Sector factors
+        sector_factors = [f for f in factor_names if f.startswith('SECTOR_')]
+        for factor in sector_factors:
+            # Convert SECTOR_Technology to "Technology Sector"
+            sector_name = factor.replace('SECTOR_', '').replace('_', ' ')
+            factor_names_list.append({
+                'MODEL': config.MODEL_NAME,
+                'FACTOR_DISPLAY_NAME': f'{sector_name} Sector',
+                'FACTOR_GROUP': 'Sector Factors'
+            })
+        
+        # Geographic factors (continent + developed/developing)
+        continent_factors = [f for f in factor_names if f.startswith('CONTINENT_')]
+        for factor in continent_factors:
+            # Convert CONTINENT_North_America_Developed to "North America Developed"
+            continent_name = factor.replace('CONTINENT_', '').replace('_', ' ')
+            factor_names_list.append({
+                'MODEL': config.MODEL_NAME,
+                'FACTOR_DISPLAY_NAME': continent_name,
+                'FACTOR_GROUP': 'Geographic Factors'
+            })
+        
+        # Intercept (if present in factor returns)
+        if 'INTERCEPT' in factor_names:
+            factor_names_list.append({
+                'MODEL': config.MODEL_NAME,
+                'FACTOR_DISPLAY_NAME': 'Intercept',
+                'FACTOR_GROUP': 'Market Factor'
+            })
+        
+        factor_names_df = pd.DataFrame(factor_names_list)
+        return factor_names_df
+    
+    @staticmethod
+    def convert_exposures_to_long_format(exposures_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Convert exposure table from wide format to long format
+        Wide: one row per stock-date, columns are factors
+        Long: one row per stock-date-factor, columns are MODEL, DATE, SECURITY_ID, FACTOR_NAME, EXPOSURE
+        
+        Args:
+            exposures_df: DataFrame in wide format with columns: FACTSET_ID, DATE, [factor columns]
+            
+        Returns:
+            DataFrame in long format with columns: MODEL, DATE, SECURITY_ID, FACTOR_NAME, EXPOSURE
+        """
+        # Identify factor columns (exclude metadata columns)
+        exclude_cols = ['FACTSET_ID', 'DATE', 'MODEL', 'SECURITY_ID']
+        factor_cols = [col for col in exposures_df.columns if col not in exclude_cols]
+        
+        # Ensure we have FACTSET_ID or SECURITY_ID
+        if 'FACTSET_ID' in exposures_df.columns:
+            id_col = 'FACTSET_ID'
+        elif 'SECURITY_ID' in exposures_df.columns:
+            id_col = 'SECURITY_ID'
+        else:
+            raise ValueError("Exposures DataFrame must have FACTSET_ID or SECURITY_ID column")
+        
+        # Melt to long format
+        id_vars = [id_col, 'DATE'] if 'DATE' in exposures_df.columns else [id_col]
+        exposures_long = exposures_df.melt(
+            id_vars=id_vars,
+            value_vars=factor_cols,
+            var_name='FACTOR_NAME',
+            value_name='EXPOSURE'
+        )
+        
+        # Rename ID column to SECURITY_ID
+        if id_col == 'FACTSET_ID':
+            exposures_long = exposures_long.rename(columns={'FACTSET_ID': 'SECURITY_ID'})
+        
+        # Add MODEL column
+        exposures_long.insert(0, 'MODEL', config.MODEL_NAME)
+        
+        # Reorder columns: MODEL, DATE, SECURITY_ID, FACTOR_NAME, EXPOSURE
+        column_order = ['MODEL', 'DATE', 'SECURITY_ID', 'FACTOR_NAME', 'EXPOSURE']
+        exposures_long = exposures_long[column_order]
+        
+        # Remove rows with NaN exposures (efficient)
+        exposures_long = exposures_long[exposures_long['EXPOSURE'].notna()]
+        
+        return exposures_long
 
 
 
