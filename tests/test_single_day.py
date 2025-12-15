@@ -2,18 +2,20 @@
 Test script to run factor model workflow for a single day (2020-01-02)
 This allows us to inspect the output tables before running the full pipeline
 """
-import pandas as pd
-from datetime import datetime, timedelta
-from pathlib import Path
-from tqdm import tqdm
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import pandas as pd
+from datetime import datetime, timedelta
+from tqdm import tqdm
+import time
+
+# Add project root to path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
 
 from src.quarter_processor import process_quarters_parallel
 from src.model_builder import FactorModelBuilder
 from src.data_retrieval import SnowflakeDataRetriever, get_date_range
-import time
 
 def test_single_day(
     test_date: str = '2020-01-02',  # Use 2020-01-02 (2020-01-01 is likely a holiday)
@@ -299,8 +301,7 @@ def test_single_day(
                     
                     try:
                         # Process additional dates using quarter_processor
-                        from src.quarter_processor import process_quarters_parallel
-                        
+                        # (process_quarters_parallel already imported at top of file)
                         additional_exposure_stats = process_quarters_parallel(
                             start_date=needed_start_date,
                             end_date=test_date,

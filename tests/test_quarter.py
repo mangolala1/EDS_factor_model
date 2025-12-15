@@ -2,18 +2,20 @@
 Test script to run factor model workflow for Q1 2020 (2020-01-01 to 2020-03-31)
 This generates all output tables for the quarter
 """
-import pandas as pd
-from datetime import datetime
-from pathlib import Path
-from tqdm import tqdm
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import pandas as pd
+from datetime import datetime
+from tqdm import tqdm
+import time
+
+# Add project root to path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
 
 from src.quarter_processor import process_quarters_parallel
 from src.model_builder import FactorModelBuilder
 from src.data_retrieval import SnowflakeDataRetriever, get_date_range
-import time
 
 
 def test_quarter(
