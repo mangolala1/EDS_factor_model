@@ -6,9 +6,13 @@ import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
 from tqdm import tqdm
-from quarter_processor import process_quarters_parallel
-from model_builder import FactorModelBuilder
-from data_retrieval import SnowflakeDataRetriever, get_date_range
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.quarter_processor import process_quarters_parallel
+from src.model_builder import FactorModelBuilder
+from src.data_retrieval import SnowflakeDataRetriever, get_date_range
 import time
 
 def test_single_day(
@@ -49,7 +53,7 @@ def test_single_day(
     if not skip_download:
         print("\n[STAGE 1] Bulk Download from Snowflake → Local Parquet Files")
         print("=" * 80)
-        from bulk_download import download_all_data
+        from src.bulk_download import download_all_data
         download_all_data(start_date, end_date, data_dir)
     else:
         print("\n[STAGE 1] Skipping download (using local Parquet files)")
@@ -295,7 +299,7 @@ def test_single_day(
                     
                     try:
                         # Process additional dates using quarter_processor
-                        from quarter_processor import process_quarters_parallel
+                        from src.quarter_processor import process_quarters_parallel
                         
                         additional_exposure_stats = process_quarters_parallel(
                             start_date=needed_start_date,

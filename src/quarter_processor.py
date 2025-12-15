@@ -9,9 +9,9 @@ from typing import Optional, Dict, List
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-import config
-from ring_buffers import StockCalculatorManager
-from continent_mapping import get_continent
+from . import config
+from .ring_buffers import StockCalculatorManager
+from .continent_mapping import get_continent
 import time
 
 
@@ -513,7 +513,7 @@ def process_quarters_parallel(
         max_workers: Number of parallel workers (default: CPU cores)
         neutralize: Whether to neutralize factors
     """
-    from data_retrieval import get_date_range
+    from .data_retrieval import get_date_range
     from pathlib import Path
     import os
     
@@ -562,7 +562,7 @@ def process_quarters_parallel(
             return {'processed': 0, 'skipped': 0}
     
     if 'COUNTRY' in universe_df.columns:
-        from continent_mapping import get_continent_developed
+        from .continent_mapping import get_continent_developed
         universe_df['CONTINENT'] = universe_df['COUNTRY'].apply(get_continent_developed)
     
     print(f"   ✓ Universe: {len(universe_df):,} stocks")

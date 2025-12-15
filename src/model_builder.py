@@ -5,7 +5,7 @@ Calculates factor returns, specific returns, specific risk, and factor covarianc
 import pandas as pd
 import numpy as np
 from typing import Dict
-import config
+from . import config
 
 
 class FactorModelBuilder:

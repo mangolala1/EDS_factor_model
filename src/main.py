@@ -8,9 +8,9 @@ import pandas as pd
 from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
-from quarter_processor import process_quarters_parallel
-from model_builder import FactorModelBuilder
-from data_retrieval import SnowflakeDataRetriever, get_date_range
+from .quarter_processor import process_quarters_parallel
+from .model_builder import FactorModelBuilder
+from .data_retrieval import SnowflakeDataRetriever, get_date_range
 import time
 
 
@@ -55,7 +55,7 @@ def main(
     if not skip_download:
         print("\n[STAGE 1] Bulk Download from Snowflake → Local Parquet Files")
         print("=" * 80)
-        from bulk_download import download_all_data
+        from .bulk_download import download_all_data
         download_all_data(start_date, end_date, data_dir)
     else:
         print("\n[STAGE 1] Skipping download (using local Parquet files)")

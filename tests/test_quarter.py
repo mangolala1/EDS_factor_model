@@ -6,9 +6,13 @@ import pandas as pd
 from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
-from quarter_processor import process_quarters_parallel
-from model_builder import FactorModelBuilder
-from data_retrieval import SnowflakeDataRetriever, get_date_range
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.quarter_processor import process_quarters_parallel
+from src.model_builder import FactorModelBuilder
+from src.data_retrieval import SnowflakeDataRetriever, get_date_range
 import time
 
 
@@ -45,7 +49,7 @@ def test_quarter(
     if not skip_download:
         print("\n[STAGE 1] Bulk Download from Snowflake → Local Parquet Files")
         print("=" * 80)
-        from bulk_download import download_all_data
+        from src.bulk_download import download_all_data
         # Need lookback for rolling calculations, so start earlier
         lookback_start = (pd.to_datetime(start_date) - pd.Timedelta(days=90)).strftime('%Y-%m-%d')
         download_all_data(lookback_start, end_date, data_dir)

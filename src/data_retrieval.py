@@ -6,7 +6,7 @@ import pandas as pd
 import yfinance as yf
 from typing import Optional, Dict, List
 from datetime import datetime, timedelta
-import config
+from . import config
 import os
 from tqdm import tqdm
 
@@ -505,7 +505,7 @@ class SnowflakeDataRetriever:
             
             # Add CONTINENT column if COUNTRY exists (now includes developed/developing)
             if 'COUNTRY' in universe.columns:
-                from continent_mapping import get_continent_developed
+                from .continent_mapping import get_continent_developed
                 universe['CONTINENT'] = universe['COUNTRY'].apply(get_continent_developed)
             pbar.update(1)
         

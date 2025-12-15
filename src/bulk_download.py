@@ -6,7 +6,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
 from tqdm import tqdm
-from data_retrieval import SnowflakeDataRetriever
+from .data_retrieval import SnowflakeDataRetriever
 
 
 def download_all_data(
