@@ -3,7 +3,7 @@ Test script to run factor model workflow for a single day (2020-01-02)
 This allows us to inspect the output tables before running the full pipeline
 """
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tqdm import tqdm
 from quarter_processor import process_quarters_parallel
@@ -26,11 +26,11 @@ def test_single_day(
         data_dir: Directory with Parquet files
         skip_download: If True, skip bulk download
     """
-    # Use a small date range around the test date (need some lookback for calculations)
-    # Start a few days before to ensure we have data
+    # Use a date range that includes enough historical data for rolling window calculations
+    # Specific risk needs 60 trading days, so we need ~90 calendar days to ensure we have enough
     from datetime import datetime, timedelta
     test_dt = datetime.strptime(test_date, '%Y-%m-%d')
-    start_date = (test_dt - timedelta(days=10)).strftime('%Y-%m-%d')
+    start_date = (test_dt - timedelta(days=90)).strftime('%Y-%m-%d')  # 90 days to ensure 60 trading days
     end_date = test_date
     
     output_path = Path(output_dir)
@@ -86,28 +86,44 @@ def test_single_day(
     print("=" * 80)
     stage3_start = time.time()
     
+    # Initialize variables that may be used later
+    exposures_df = None
+    exposures_df_test_date = None
+    returns_df = None
+    model_builder = None
+    
     try:
         print("Loading exposures from CSV...")
         with tqdm(total=1, desc="Loading exposures", bar_format='{desc}: {elapsed}') as pbar:
             exposures_long_df = pd.read_csv(exposures_csv_path)
             exposures_long_df['DATE'] = pd.to_datetime(exposures_long_df['DATE'])
             
-            # Filter to test date only
-            exposures_long_df = exposures_long_df[exposures_long_df['DATE'] == test_date]
-            print(f"   Filtered to {test_date}: {len(exposures_long_df):,} exposure rows")
+            # Load all exposures in the date range (needed for factor returns calculation)
+            # But we'll filter to test date for specific risk calculation later
+            print(f"   Loaded exposures for date range: {len(exposures_long_df):,} total exposure rows")
+            print(f"   Date range: {exposures_long_df['DATE'].min()} to {exposures_long_df['DATE'].max()}")
             
             # Convert long format to wide format for regression calculations
-            exposures_df = exposures_long_df.pivot_table(
+            exposures_df_all = exposures_long_df.pivot_table(
                 index=['SECURITY_ID', 'DATE'],
                 columns='FACTOR_NAME',
                 values='EXPOSURE',
                 aggfunc='first'
             )
-            exposures_df = exposures_df.rename_axis(None, axis=1)
-            exposures_df = exposures_df.rename_axis(['FACTSET_ID', 'DATE'])
+            exposures_df_all = exposures_df_all.rename_axis(None, axis=1)
+            exposures_df_all = exposures_df_all.rename_axis(['FACTSET_ID', 'DATE'])
+            
+            # Keep all exposures for factor returns calculation
+            exposures_df = exposures_df_all
+            
+            # Also create a filtered version for the test date (for specific risk)
+            test_date_dt = pd.to_datetime(test_date)
+            exposures_df_test_date = exposures_df_all[exposures_df_all.index.get_level_values('DATE') == test_date_dt]
+            
             pbar.update(1)
         
-        print(f"   ✓ Loaded {len(exposures_long_df):,} exposure observations for {test_date}")
+        print(f"   ✓ Loaded {len(exposures_long_df):,} exposure observations")
+        print(f"   ✓ Exposures for test date ({test_date}): {len(exposures_df_test_date):,} rows")
         
         # Load returns from Parquet
         print("Loading returns from Parquet...")
@@ -119,23 +135,51 @@ def test_single_day(
             if 'P_DATE' in returns_df.columns:
                 returns_df = returns_df.rename(columns={'P_DATE': 'DATE'})
             returns_df['DATE'] = pd.to_datetime(returns_df['DATE'])
-            # Filter to test date
-            returns_df = returns_df[returns_df['DATE'] == test_date]
+            
+            # For specific risk calculation, we need ALL historical data up to test_date
+            # Don't filter to just the processed dates - use all available data
+            test_date_dt = pd.to_datetime(test_date)
+            returns_df = returns_df[returns_df['DATE'] <= test_date_dt]
+            
+            print(f"   Loaded ALL returns up to {test_date}: {len(returns_df):,} rows")
         else:
             print("   ⚠ returns.parquet not found - please run bulk_download.py first")
             returns_df = pd.DataFrame()
         
-        print(f"   ✓ Loaded {len(returns_df):,} return observations for {test_date}")
+        print(f"   ✓ Loaded {len(returns_df):,} return observations")
+        print(f"   ✓ Date range: {returns_df['DATE'].min()} to {returns_df['DATE'].max()}")
+        print(f"   ✓ Unique dates: {returns_df['DATE'].nunique()}")
         
         # Calculate factor returns
+        # We need factor returns for ALL dates where we have both exposures and returns
+        # This gives us the historical factor returns needed for the rolling window
         print("Calculating factor returns...")
-        with tqdm(total=1, desc="Factor returns", bar_format='{desc}: {elapsed}') as pbar:
-            model_builder = FactorModelBuilder(exposures_df, pd.Series(dtype=float))
-            factor_returns_df = model_builder.calculate_daily_factor_returns(
-                exposures_df=exposures_df,
-                returns_df=returns_df
-            )
-            pbar.update(1)
+        print(f"   Note: Calculating factor returns for all dates with both exposures and returns")
+        
+        # Get all dates where we have both exposures and returns
+        exposure_dates = set(exposures_df.index.get_level_values('DATE').unique())
+        return_dates = set(returns_df['DATE'].unique())
+        common_dates = sorted(exposure_dates & return_dates)
+        
+        print(f"   Dates with exposures: {len(exposure_dates)}")
+        print(f"   Dates with returns: {len(return_dates)}")
+        print(f"   Common dates (will calculate factor returns): {len(common_dates)}")
+        
+        if len(common_dates) > 0:
+            # Filter to common dates only
+            exposures_for_factor_returns = exposures_df[exposures_df.index.get_level_values('DATE').isin(common_dates)]
+            returns_for_factor_returns = returns_df[returns_df['DATE'].isin(common_dates)]
+            
+            with tqdm(total=1, desc="Factor returns", bar_format='{desc}: {elapsed}') as pbar:
+                model_builder = FactorModelBuilder(exposures_for_factor_returns, pd.Series(dtype=float))
+                factor_returns_df = model_builder.calculate_daily_factor_returns(
+                    exposures_df=exposures_for_factor_returns,
+                    returns_df=returns_for_factor_returns
+                )
+                pbar.update(1)
+        else:
+            print("   ⚠ No common dates between exposures and returns")
+            factor_returns_df = None
         
         if len(factor_returns_df) > 0:
             # Save to CSV
@@ -167,11 +211,17 @@ def test_single_day(
     stage4_start = time.time()
     
     try:
-        if factor_returns_df is not None:
+        if factor_returns_df is not None and exposures_df is not None:
+            # Use exposures for test date only
+            test_date_dt = pd.to_datetime(test_date)
+            if exposures_df_test_date is None:
+                exposures_df_test_date = exposures_df[exposures_df.index.get_level_values('DATE') == test_date_dt]
+            returns_df_test_date = returns_df[returns_df['DATE'] == test_date_dt] if returns_df is not None else pd.DataFrame()
+            
             with tqdm(total=1, desc="Specific returns", bar_format='{desc}: {elapsed}') as pbar:
                 specific_returns_df = model_builder.calculate_specific_returns(
-                    exposures_df=exposures_df,
-                    returns_df=returns_df,
+                    exposures_df=exposures_df_test_date,
+                    returns_df=returns_df_test_date,
                     factor_returns_df=factor_returns_df
                 )
                 pbar.update(1)
@@ -198,17 +248,147 @@ def test_single_day(
     print(f"[{datetime.now().strftime('%H:%M:%S')}] [STAGE 5] Calculating Specific Risk")
     print("=" * 80)
     print("   Note: Specific risk requires 60 days of historical data (rolling window)")
-    print("   For single day test, this will be skipped or show limited results")
     
+    specific_risk_df = None
     try:
-        if factor_returns_df is not None and len(exposures_df) > 0:
-            # Try to calculate with available data (may have limited results)
-            specific_risk_df = model_builder.calculate_specific_risk(
-                exposures_df=exposures_df,
-                returns_df=returns_df,
-                factor_returns_df=factor_returns_df,
-                window=60
-            )
+        # Check prerequisites
+        if factor_returns_df is None:
+            print("   ⚠ Skipped (no factor returns)")
+        elif exposures_df_test_date is None:
+            print("   ⚠ Skipped (exposures_df_test_date is None)")
+        elif len(exposures_df_test_date) == 0:
+            print("   ⚠ Skipped (no exposures for test date)")
+        elif returns_df is None or len(returns_df) == 0:
+            print("   ⚠ Skipped (no returns data)")
+        else:
+            # Debug info
+            print(f"   Checking prerequisites...")
+            print(f"   - Exposures for test date: {len(exposures_df_test_date):,} rows")
+            print(f"   - Returns data: {len(returns_df):,} rows, {returns_df['DATE'].nunique()} unique dates")
+            print(f"   - Factor returns: {len(factor_returns_df):,} rows, {factor_returns_df['DATE'].nunique()} unique dates")
+            print(f"   - Date range in returns: {returns_df['DATE'].min()} to {returns_df['DATE'].max()}")
+            print(f"   - Date range in factor returns: {factor_returns_df['DATE'].min()} to {factor_returns_df['DATE'].max()}")
+            
+            # Check if we have enough historical data
+            test_date_dt = pd.to_datetime(test_date)
+            factor_returns_dates = pd.to_datetime(factor_returns_df['DATE'].unique())
+            dates_before_test = factor_returns_dates[factor_returns_dates < test_date_dt]
+            
+            print(f"   - Factor return dates before test date: {len(dates_before_test)}")
+            
+            # If we don't have enough data, try to process more dates from parquet files
+            if len(dates_before_test) < 60:
+                print(f"   ⚠ Only {len(dates_before_test)} days of factor returns before test date")
+                print(f"   ⚠ Need at least 60 days for rolling window calculation")
+                print(f"   → Attempting to process additional historical dates from parquet files...")
+                
+                # Check if parquet files have more data
+                needed_start_date = (test_date_dt - timedelta(days=90)).strftime('%Y-%m-%d')
+                returns_in_range = returns_df[returns_df['DATE'] >= needed_start_date]
+                return_dates_available = sorted(returns_in_range['DATE'].unique())
+                
+                print(f"   - Returns available in parquet from {needed_start_date}: {len(return_dates_available)} dates")
+                
+                if len(return_dates_available) >= 60:
+                    # We have returns data, but need to process exposures for those dates
+                    print(f"   → Processing exposures for {len(return_dates_available)} additional dates...")
+                    
+                    try:
+                        # Process additional dates using quarter_processor
+                        from quarter_processor import process_quarters_parallel
+                        
+                        additional_exposure_stats = process_quarters_parallel(
+                            start_date=needed_start_date,
+                            end_date=test_date,
+                            output_dir=output_dir,
+                            data_dir=data_dir,
+                            max_workers=1,
+                            neutralize=False
+                        )
+                        
+                        if additional_exposure_stats['processed'] > 0:
+                            # Reload exposures CSV to get the new data
+                            print(f"   → Reloading exposures with additional {additional_exposure_stats['processed']} dates...")
+                            exposures_long_df_updated = pd.read_csv(exposures_csv_path)
+                            exposures_long_df_updated['DATE'] = pd.to_datetime(exposures_long_df_updated['DATE'])
+                            
+                            # Convert to wide format
+                            exposures_df_updated = exposures_long_df_updated.pivot_table(
+                                index=['SECURITY_ID', 'DATE'],
+                                columns='FACTOR_NAME',
+                                values='EXPOSURE',
+                                aggfunc='first'
+                            )
+                            exposures_df_updated = exposures_df_updated.rename_axis(None, axis=1)
+                            exposures_df_updated = exposures_df_updated.rename_axis(['FACTSET_ID', 'DATE'])
+                            
+                            # Recalculate factor returns with all dates
+                            exposure_dates_updated = set(exposures_df_updated.index.get_level_values('DATE').unique())
+                            return_dates_set = set(returns_df['DATE'].unique())
+                            common_dates_updated = sorted(exposure_dates_updated & return_dates_set)
+                            
+                            if len(common_dates_updated) >= 60:
+                                print(f"   → Recalculating factor returns for {len(common_dates_updated)} dates...")
+                                exposures_for_factor_returns_updated = exposures_df_updated[
+                                    exposures_df_updated.index.get_level_values('DATE').isin(common_dates_updated)
+                                ]
+                                returns_for_factor_returns_updated = returns_df[returns_df['DATE'].isin(common_dates_updated)]
+                                
+                                model_builder = FactorModelBuilder(exposures_for_factor_returns_updated, pd.Series(dtype=float))
+                                factor_returns_df = model_builder.calculate_daily_factor_returns(
+                                    exposures_df=exposures_for_factor_returns_updated,
+                                    returns_df=returns_for_factor_returns_updated
+                                )
+                                
+                                # Update exposures_df_test_date
+                                exposures_df_test_date = exposures_df_updated[
+                                    exposures_df_updated.index.get_level_values('DATE') == test_date_dt
+                                ]
+                                
+                                # Update main exposures_df for consistency
+                                exposures_df = exposures_df_updated
+                                
+                                # Check again
+                                factor_returns_dates = pd.to_datetime(factor_returns_df['DATE'].unique())
+                                dates_before_test = factor_returns_dates[factor_returns_dates < test_date_dt]
+                                print(f"   ✓ Now have {len(dates_before_test)} days of factor returns before test date")
+                            else:
+                                print(f"   ⚠ Still only {len(common_dates_updated)} common dates after processing")
+                        else:
+                            print(f"   ⚠ Could not process additional dates (may need to download more data)")
+                    except Exception as e:
+                        print(f"   ⚠ Error processing additional dates: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print(f"   ⚠ Not enough returns data in parquet files")
+                    print(f"   ⚠ Need to download more data from Snowflake (run bulk_download.py)")
+            
+            # Final check before calculating specific risk
+            # Re-check dates_before_test in case we updated factor_returns_df
+            factor_returns_dates_final = pd.to_datetime(factor_returns_df['DATE'].unique())
+            dates_before_test_final = factor_returns_dates_final[factor_returns_dates_final < test_date_dt]
+            
+            if test_date_dt not in factor_returns_dates_final:
+                print(f"   ⚠ WARNING: Test date {test_date} not found in factor returns")
+                print(f"   ⚠ Cannot calculate specific risk for this date")
+                specific_risk_df = None
+            elif len(dates_before_test_final) < 60:
+                print(f"   ⚠ Still insufficient data: {len(dates_before_test_final)} days (need 60)")
+                print(f"   ⚠ Cannot calculate specific risk - need more historical data")
+                print(f"   ⚠ Try: Download more data or use a later test date")
+                specific_risk_df = None
+            else:
+                # Use exposures for test date only, but returns and factor_returns need full history
+                print(f"   ✓ Sufficient data available ({len(dates_before_test_final)} days), calculating specific risk...")
+                # model_builder is already available (either original or updated)
+                specific_risk_df = model_builder.calculate_specific_risk(
+                    exposures_df=exposures_df_test_date,
+                    returns_df=returns_df,
+                    factor_returns_df=factor_returns_df,
+                    window=60
+                )
+            
             if len(specific_risk_df) > 0:
                 specific_risk_df['DATE'] = pd.to_datetime(specific_risk_df['DATE']).dt.strftime('%Y-%m-%d')
                 specific_risk_csv = output_path / 'specific_risk.csv'
@@ -219,12 +399,12 @@ def test_single_day(
                 print(f"   ✓ Also saved as variance.csv → {variance_csv}")
             else:
                 specific_risk_df = None
-                print("   ⚠ No specific risk calculated (insufficient historical data for single day)")
-        else:
-            specific_risk_df = None
-            print("   ⚠ Skipped (no factor returns or exposures)")
+                print("   ⚠ No specific risk calculated (returned empty DataFrame)")
+                print("   ⚠ This usually means insufficient historical data (need 60 trading days)")
     except Exception as e:
-        print(f"   ⚠ WARNING: {str(e)}")
+        print(f"   ✗ ERROR in specific risk calculation: {str(e)}")
+        import traceback
+        traceback.print_exc()
         specific_risk_df = None
     
     # Step 6: Factor covariance (skip for single day - needs rolling window)
@@ -301,6 +481,8 @@ def test_single_day(
         print(f"  - {output_path / 'factor_returns.csv'}")
     if specific_returns_df is not None:
         print(f"  - {output_path / 'specific_returns.csv'}")
+    if specific_risk_df is not None:
+        print(f"  - {output_path / 'specific_risk.csv'} (MODEL, DATE, SECURITY_ID, SPECIFIC_VAR)")
     if factor_names_df is not None:
         print(f"  - {output_path / 'factor_model_factor_names.csv'}")
     print("=" * 80)
@@ -310,7 +492,8 @@ def test_single_day(
         'processed': exposure_stats['processed'],
         'exposures_count': len(exposures_long_df),
         'factor_returns_count': len(factor_returns_df) if factor_returns_df is not None else 0,
-        'specific_returns_count': len(specific_returns_df) if specific_returns_df is not None else 0
+        'specific_returns_count': len(specific_returns_df) if specific_returns_df is not None else 0,
+        'specific_risk_count': len(specific_risk_df) if specific_risk_df is not None else 0
     }
 
 
@@ -332,6 +515,10 @@ if __name__ == "__main__":
         print(f"✓ Exposures: {results['exposures_count']:,} rows")
         print(f"✓ Factor Returns: {results['factor_returns_count']:,} rows")
         print(f"✓ Specific Returns: {results['specific_returns_count']:,} rows")
+        if results['specific_risk_count'] > 0:
+            print(f"✓ Specific Risk: {results['specific_risk_count']:,} rows")
+        else:
+            print(f"⚠ Specific Risk: {results['specific_risk_count']:,} rows (not calculated)")
         print("\nYou can now inspect the CSV files in the 'test_results' directory")
         print("=" * 80)
 

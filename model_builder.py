@@ -548,14 +548,13 @@ class FactorModelBuilder:
                                 window: int = 60,
                                 epsilon: float = 1e-8) -> pd.DataFrame:
         """
-        Calculate specific risk (specific variance and volatility) using rolling window
+        Calculate specific risk (specific variance) using rolling window
         
         For each as-of date T:
         1. Factor covariance: Σ_f(T) = Cov_60(f_{.,t}) for t = T-59, ..., T
         2. Total variance: Var(r_i)_T = Var_60(r_{i,t}) for t = T-59, ..., T
         3. Factor variance: σ²_factor,i(T) = β_{i,T}^T * Σ_f(T) * β_{i,T}
         4. Specific variance: SPECIFIC_VAR_{i,T} = max(Var(r_i)_T - σ²_factor,i(T), ε)
-        5. Specific volatility: SPECIFIC_VOL_{i,T} = sqrt(SPECIFIC_VAR_{i,T})
         
         Args:
             exposures_df: DataFrame with factor exposures (index: FACTSET_ID, DATE)
@@ -565,11 +564,8 @@ class FactorModelBuilder:
             epsilon: Floor value for specific variance to avoid negatives (default: 1e-8)
             
         Returns:
-            DataFrame with columns: MODEL, DATE, FACTSET_ID, TOTAL_VAR, FACTOR_VAR, SPECIFIC_VAR, SPECIFIC_VOL
-            - TOTAL_VAR: Total variance of stock returns (60-day rolling window)
-            - FACTOR_VAR: Factor variance = β^T * Σ_f * β (using 60-day rolling covariance matrix)
+            DataFrame with columns: MODEL, DATE, SECURITY_ID, SPECIFIC_VAR
             - SPECIFIC_VAR: Specific variance = TOTAL_VAR - FACTOR_VAR
-            - SPECIFIC_VOL: Specific volatility = sqrt(SPECIFIC_VAR)
         """
         print(f"  Calculating specific risk with {window}-day rolling window...")
         
@@ -615,16 +611,23 @@ class FactorModelBuilder:
         factor_names = [col for col in exposures_df.columns]
         factor_names_for_cov = [f for f in factor_returns_wide.columns if f != 'INTERCEPT']
         
+        # OPTIMIZATION: Pre-group exposures by date to avoid repeated filtering
+        exposures_by_date = exposures_reset.groupby('DATE')
+        
         specific_risk_list = []
         
         print(f"  Processing {len(all_dates)} dates...")
         
         for i, date_T in enumerate(all_dates):
-            if (i + 1) % 100 == 0:
+            if (i + 1) % 10 == 0 or i == len(all_dates) - 1:
                 print(f"    Processed {i+1}/{len(all_dates)} dates...")
             
-            # Get exposures for date T
-            exposures_T = exposures_reset[exposures_reset['DATE'] == date_T].copy()
+            # Get exposures for date T (using groupby is faster than filtering)
+            try:
+                exposures_T = exposures_by_date.get_group(date_T)
+            except KeyError:
+                continue
+            
             if len(exposures_T) == 0:
                 continue
             
@@ -641,7 +644,7 @@ class FactorModelBuilder:
                 # Not enough data
                 continue
             
-            # 1. Calculate factor covariance matrix Σ_f(T)
+            # 1. Calculate factor covariance matrix Σ_f(T) (once per date, not per stock)
             # Use only non-intercept factors for covariance
             factor_returns_for_cov = factor_returns_window[factor_names_for_cov]
             factor_cov_matrix = factor_returns_for_cov.cov().values
@@ -649,23 +652,34 @@ class FactorModelBuilder:
             # Create mapping from factor name to index
             factor_idx_map = {f: idx for idx, f in enumerate(factor_names_for_cov)}
             
+            # OPTIMIZATION: Pre-filter returns by date range once (not per stock)
+            window_start_date = factor_returns_window.index[0]
+            returns_window = returns_prep[
+                (returns_prep['DATE'] >= window_start_date) & 
+                (returns_prep['DATE'] <= date_T)
+            ].copy()
+            
+            # OPTIMIZATION: Group returns by security_id for faster lookups
+            returns_by_security = returns_window.groupby('SECURITY_ID')['ONE_DAY_PCT']
+            
             # 2. For each stock, calculate total variance and factor variance
+            # OPTIMIZATION: Iterate over rows but use pre-filtered returns
             for _, stock_row in exposures_T.iterrows():
                 security_id = stock_row['SECURITY_ID']
                 
-                # Get stock returns window: T-59 to T
-                stock_returns_window = returns_prep[
-                    (returns_prep['SECURITY_ID'] == security_id) &
-                    (returns_prep['DATE'] <= date_T) &
-                    (returns_prep['DATE'] >= factor_returns_window.index[0])
-                ]['ONE_DAY_PCT'].dropna()
+                # OPTIMIZATION: Get stock returns from pre-filtered and grouped data (O(1) lookup)
+                try:
+                    stock_returns_series = returns_by_security.get_group(security_id).dropna()
+                except KeyError:
+                    # Stock not in returns for this window
+                    continue
                 
-                if len(stock_returns_window) < window // 2:
+                if len(stock_returns_series) < window // 2:
                     # Not enough return history
                     continue
                 
                 # Calculate total variance: Var_60(r_{i,t})
-                total_var = stock_returns_window.var()
+                total_var = stock_returns_series.var()
                 
                 if pd.isna(total_var) or total_var <= 0:
                     continue
@@ -697,17 +711,11 @@ class FactorModelBuilder:
                 # 4. Calculate specific variance: max(Var(r_i)_T - σ²_factor,i(T), ε)
                 specific_var = max(total_var - factor_var, epsilon)
                 
-                # 5. Calculate specific volatility: sqrt(SPECIFIC_VAR)
-                specific_vol = np.sqrt(specific_var)
-                
                 specific_risk_list.append({
                     'MODEL': config.MODEL_NAME,
                     'DATE': date_T,
                     'SECURITY_ID': security_id,
-                    'TOTAL_VAR': total_var,  # Total variance of returns (60-day rolling)
-                    'FACTOR_VAR': factor_var,  # Factor variance = β^T * Σ_f * β (60-day rolling)
-                    'SPECIFIC_VAR': specific_var,  # Specific variance = TOTAL_VAR - FACTOR_VAR
-                    'SPECIFIC_VOL': specific_vol  # Specific volatility = sqrt(SPECIFIC_VAR)
+                    'SPECIFIC_VAR': specific_var  # Specific variance = TOTAL_VAR - FACTOR_VAR
                 })
         
         specific_risk_df = pd.DataFrame(specific_risk_list)

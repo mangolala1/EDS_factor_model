@@ -1,8 +1,6 @@
 """
-Streamlined main workflow for EDS Factor Model
-1. Download all data from Snowflake (one-time) → Parquet files
-2. Process quarters in parallel → CSV files
-3. Calculate factor returns, specific returns, risk, covariance → CSV files
+Test script to run factor model workflow for Q1 2020 (2020-01-01 to 2020-03-31)
+This generates all output tables for the quarter
 """
 import pandas as pd
 from datetime import datetime
@@ -14,38 +12,30 @@ from data_retrieval import SnowflakeDataRetriever, get_date_range
 import time
 
 
-def main(
+def test_quarter(
     start_date: str = '2020-01-01',
-    end_date: str = None,
-    neutralize: bool = False,
-    output_dir: str = 'results',
+    end_date: str = '2020-03-31',
+    output_dir: str = 'test_results_q1_2020',
     data_dir: str = 'data',
-    skip_download: bool = False
+    skip_download: bool = True  # Assume data already downloaded
 ):
     """
-    Main workflow - streamlined and fast!
-    Downloads data once, then works entirely with local Parquet files (no Snowflake queries!)
-    All results saved to CSV files (no SQLite!)
+    Test workflow for Q1 2020
     
     Args:
-        start_date: Start date
-        end_date: End date (default: today)
-        neutralize: Whether to neutralize factors
-        output_dir: Directory to save CSV result files
-        data_dir: Directory with Parquet files (prices.parquet, returns.parquet, etc.)
-        skip_download: If True, skip bulk download (assumes data already downloaded)
+        start_date: Start date (default: 2020-01-01)
+        end_date: End date (default: 2020-03-31)
+        output_dir: Directory to save test results
+        data_dir: Directory with Parquet files
+        skip_download: If True, skip bulk download
     """
-    if end_date is None:
-        _, end_date = get_date_range(lookback_days=1)
-    
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    main_start_time = time.time()
     print("=" * 80)
-    print("EDS Factor Model - Streamlined Workflow (CSV Output)")
+    print("EDS Factor Model - Q1 2020 Test")
     print("=" * 80)
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting workflow...")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Processing Q1 2020")
     print(f"Date range: {start_date} to {end_date}")
     print(f"Data directory: {data_dir}")
     print(f"Output directory: {output_dir}")
@@ -56,13 +46,15 @@ def main(
         print("\n[STAGE 1] Bulk Download from Snowflake → Local Parquet Files")
         print("=" * 80)
         from bulk_download import download_all_data
-        download_all_data(start_date, end_date, data_dir)
+        # Need lookback for rolling calculations, so start earlier
+        lookback_start = (pd.to_datetime(start_date) - pd.Timedelta(days=90)).strftime('%Y-%m-%d')
+        download_all_data(lookback_start, end_date, data_dir)
     else:
         print("\n[STAGE 1] Skipping download (using local Parquet files)")
     
-    # Step 2: Process quarters in parallel
+    # Step 2: Process quarters
     print("\n" + "=" * 80)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [STAGE 2] Processing Quarters in Parallel (Local Parquet Files)")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [STAGE 2] Processing Quarters")
     print("=" * 80)
     stage2_start = time.time()
     
@@ -71,8 +63,8 @@ def main(
         end_date=end_date,
         output_dir=output_dir,
         data_dir=data_dir,
-        max_workers=None,  # Auto-detect
-        neutralize=neutralize
+        max_workers=1,  # Single worker for test
+        neutralize=False
     )
     
     if exposure_stats['processed'] == 0:
@@ -98,24 +90,23 @@ def main(
             exposures_long_df = pd.read_csv(exposures_csv_path)
             exposures_long_df['DATE'] = pd.to_datetime(exposures_long_df['DATE'])
             
+            print(f"   ✓ Loaded {len(exposures_long_df):,} exposure observations")
+            print(f"   ✓ Date range: {exposures_long_df['DATE'].min()} to {exposures_long_df['DATE'].max()}")
+            print(f"   ✓ Unique dates: {exposures_long_df['DATE'].nunique()}")
+            print(f"   ✓ Unique securities: {exposures_long_df['SECURITY_ID'].nunique()}")
+            
             # Convert long format to wide format for regression calculations
-            # Long format: MODEL, DATE, SECURITY_ID, FACTOR_NAME, EXPOSURE
-            # Wide format needed: index=(FACTSET_ID, DATE), columns=FACTOR_NAME
             exposures_df = exposures_long_df.pivot_table(
                 index=['SECURITY_ID', 'DATE'],
                 columns='FACTOR_NAME',
                 values='EXPOSURE',
-                aggfunc='first'  # Should be unique, but use first if duplicates
+                aggfunc='first'
             )
-            exposures_df = exposures_df.rename_axis(None, axis=1)  # Remove FACTOR_NAME from column index name
-            exposures_df = exposures_df.rename_axis(['FACTSET_ID', 'DATE'])  # Set index names
+            exposures_df = exposures_df.rename_axis(None, axis=1)
+            exposures_df = exposures_df.rename_axis(['FACTSET_ID', 'DATE'])
             pbar.update(1)
         
-        print(f"   ✓ Loaded {len(exposures_long_df):,} exposure observations (long format), converted to wide for calculations")
-        print(f"   ✓ Unique securities in exposures: {exposures_long_df['SECURITY_ID'].nunique():,}")
-        print(f"   ✓ Unique dates in exposures: {exposures_long_df['DATE'].nunique():,}")
-        
-        # Load returns from Parquet (fast!)
+        # Load returns from Parquet
         print("Loading returns from Parquet...")
         returns_path = Path(data_dir) / 'returns.parquet'
         if returns_path.exists():
@@ -125,6 +116,7 @@ def main(
             if 'P_DATE' in returns_df.columns:
                 returns_df = returns_df.rename(columns={'P_DATE': 'DATE'})
             returns_df['DATE'] = pd.to_datetime(returns_df['DATE'])
+            
             # Filter to date range and trading dates from exposures
             trading_dates = exposures_df.index.get_level_values('DATE').unique()
             returns_df = returns_df[returns_df['DATE'].isin(trading_dates)]
@@ -147,15 +139,15 @@ def main(
             pbar.update(1)
         
         if len(factor_returns_df) > 0:
-            # Save to CSV (convert DATE to string for CSV)
+            # Save to CSV
             factor_returns_for_csv = factor_returns_df.copy()
             factor_returns_for_csv['DATE'] = pd.to_datetime(factor_returns_for_csv['DATE']).dt.strftime('%Y-%m-%d')
             factor_returns_csv = output_path / 'factor_returns.csv'
             factor_returns_for_csv.to_csv(factor_returns_csv, index=False)
             print(f"   ✓ Saved {len(factor_returns_df):,} factor return observations → {factor_returns_csv}")
-            # Keep factor_returns_df with datetime for later calculations
         else:
             factor_returns_df = None
+            print("   ⚠ No factor returns calculated")
         
     except Exception as e:
         print(f"\n✗ ERROR: {str(e)}")
@@ -185,12 +177,13 @@ def main(
                 specific_returns_csv = output_path / 'specific_returns.csv'
                 specific_returns_df.to_csv(specific_returns_csv, index=False)
                 print(f"   ✓ Saved {len(specific_returns_df):,} specific return observations → {specific_returns_csv}")
-                print(f"   ✓ Unique securities in specific returns: {specific_returns_df['SECURITY_ID'].nunique():,}")
-                print(f"   ✓ Unique dates in specific returns: {specific_returns_df['DATE'].nunique():,}")
-            else:
-                print("   ⚠ WARNING: No specific returns calculated - check if exposures and returns have matching securities/dates")
+        else:
+            specific_returns_df = None
+            print("   ⚠ Skipped (no factor returns)")
     except Exception as e:
         print(f"\n⚠ WARNING: {str(e)}")
+        import traceback
+        traceback.print_exc()
         specific_returns_df = None
     
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Stage 4 completed in {time.time() - stage4_start:.1f}s")
@@ -202,7 +195,7 @@ def main(
     stage5_start = time.time()
     
     try:
-        if factor_returns_df is not None:
+        if factor_returns_df is not None and len(exposures_df) > 0:
             with tqdm(total=1, desc="Specific risk", bar_format='{desc}: {elapsed}') as pbar:
                 specific_risk_df = model_builder.calculate_specific_risk(
                     exposures_df=exposures_df,
@@ -220,6 +213,12 @@ def main(
                 specific_risk_df.to_csv(variance_csv, index=False)
                 print(f"   ✓ Saved {len(specific_risk_df):,} specific risk observations → {specific_risk_csv}")
                 print(f"   ✓ Also saved as variance.csv → {variance_csv}")
+            else:
+                specific_risk_df = None
+                print("   ⚠ No specific risk calculated (insufficient historical data)")
+        else:
+            specific_risk_df = None
+            print("   ⚠ Skipped (no factor returns or exposures)")
     except Exception as e:
         print(f"\n⚠ WARNING in specific risk calculation: {str(e)}")
         import traceback
@@ -236,8 +235,7 @@ def main(
     
     try:
         if factor_returns_df is not None:
-            # factor_returns_df already has datetime DATE column
-            with tqdm(total=1, desc="Covariance", bar_format='{desc}: {elapsed}') as pbar:
+            with tqdm(total=1, desc="Factor covariance", bar_format='{desc}: {elapsed}') as pbar:
                 covariance_df = model_builder.calculate_factor_covariance(
                     factor_returns_df=factor_returns_df,
                     lookback_window=60
@@ -248,8 +246,16 @@ def main(
                 covariance_csv = output_path / 'factor_covariance.csv'
                 covariance_df.to_csv(covariance_csv, index=False)
                 print(f"   ✓ Saved {len(covariance_df):,} covariance observations → {covariance_csv}")
+            else:
+                covariance_df = None
+                print("   ⚠ No covariance calculated (insufficient historical data)")
+        else:
+            covariance_df = None
+            print("   ⚠ Skipped (no factor returns)")
     except Exception as e:
-        print(f"\n⚠ WARNING: {str(e)}")
+        print(f"\n⚠ WARNING in covariance calculation: {str(e)}")
+        import traceback
+        traceback.print_exc()
         covariance_df = None
     
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Stage 6 completed in {time.time() - stage6_start:.1f}s")
@@ -261,24 +267,17 @@ def main(
     stage7_start = time.time()
     
     try:
-        # Load exposures in long format for factor name extraction
-        exposures_for_names = pd.read_csv(exposures_csv_path)
-        
-        # Convert long format to wide format temporarily to extract factor names
-        if 'FACTOR_NAME' in exposures_for_names.columns:
-            # Already in long format, convert to wide
-            exposures_wide_for_names = exposures_for_names.pivot_table(
-                index=['SECURITY_ID', 'DATE'],
-                columns='FACTOR_NAME',
-                values='EXPOSURE',
-                aggfunc='first'
-            ).reset_index()
-        else:
-            exposures_wide_for_names = exposures_for_names
+        # Convert exposures to wide format for factor names
+        exposures_wide = exposures_long_df.pivot_table(
+            index=['SECURITY_ID', 'DATE'],
+            columns='FACTOR_NAME',
+            values='EXPOSURE',
+            aggfunc='first'
+        ).reset_index()
         
         # Generate factor names table
         with tqdm(total=1, desc="Factor names", bar_format='{desc}: {elapsed}') as pbar:
-            factor_names_df = model_builder.create_factor_names_table(exposures_wide_for_names)
+            factor_names_df = model_builder.create_factor_names_table(exposures_wide)
             pbar.update(1)
         
         if len(factor_names_df) > 0:
@@ -295,11 +294,12 @@ def main(
     
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Stage 7 completed in {time.time() - stage7_start:.1f}s")
     
-    total_time = time.time() - main_start_time
+    # Summary
+    total_time = time.time() - stage2_start
     print("\n" + "=" * 80)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] WORKFLOW COMPLETE")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] TEST COMPLETE")
     print("=" * 80)
-    print(f"✓ Total time: {total_time/60:.1f} minutes ({total_time:.1f} seconds)")
+    print(f"✓ Total time: {total_time:.1f} seconds")
     print(f"✓ Processed {exposure_stats['processed']} dates")
     print(f"✓ All results saved to CSV files in: {output_dir}/")
     print("\nOutput CSV files:")
@@ -316,18 +316,42 @@ def main(
         print(f"  - {output_path / 'factor_model_factor_names.csv'} (MODEL, FACTOR_DISPLAY_NAME, FACTOR_GROUP)")
     print("=" * 80)
     
-    return {'output_dir': output_dir, 'processed': exposure_stats['processed']}
+    return {
+        'output_dir': output_dir,
+        'processed': exposure_stats['processed'],
+        'exposures_count': len(exposures_long_df),
+        'factor_returns_count': len(factor_returns_df) if factor_returns_df is not None else 0,
+        'specific_returns_count': len(specific_returns_df) if specific_returns_df is not None else 0,
+        'specific_risk_count': len(specific_risk_df) if specific_risk_df is not None else 0,
+        'covariance_count': len(covariance_df) if covariance_df is not None else 0
+    }
 
 
 if __name__ == "__main__":
-    # First run: download data, then process
-    # Subsequent runs: skip download, just process
-    results = main(
+    # Test Q1 2020
+    results = test_quarter(
         start_date='2020-01-01',
-        end_date=None,
-        neutralize=False,
-        output_dir='results',
+        end_date='2020-03-31',
+        output_dir='test_results_q1_2020',
         data_dir='data',
-        skip_download=True  # Set to True if data already downloaded
+        skip_download=True  # Set to False if you need to download data first
     )
+    
+    if results:
+        print("\n" + "=" * 80)
+        print("TEST SUMMARY")
+        print("=" * 80)
+        print(f"✓ Exposures: {results['exposures_count']:,} rows")
+        print(f"✓ Factor Returns: {results['factor_returns_count']:,} rows")
+        print(f"✓ Specific Returns: {results['specific_returns_count']:,} rows")
+        if results['specific_risk_count'] > 0:
+            print(f"✓ Specific Risk: {results['specific_risk_count']:,} rows")
+        else:
+            print(f"⚠ Specific Risk: {results['specific_risk_count']:,} rows (not calculated)")
+        if results['covariance_count'] > 0:
+            print(f"✓ Factor Covariance: {results['covariance_count']:,} rows")
+        else:
+            print(f"⚠ Factor Covariance: {results['covariance_count']:,} rows (not calculated)")
+        print("\nYou can now inspect the CSV files in the 'test_results_q1_2020' directory")
+        print("=" * 80)
 

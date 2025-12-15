@@ -737,34 +737,27 @@ FOR each as_of_date T:
         # Step 3: Calculate specific variance
         specific_var = max(total_var - factor_var, epsilon)  # epsilon = 1e-8
         
-        # Step 4: Calculate specific volatility
-        specific_vol = sqrt(specific_var)
-        
         variance_table.append({
             'MODEL': 'EDS_MODEL',
             'DATE': T,
             'SECURITY_ID': stock_id[i],
-            'TOTAL_VAR': total_var,
-            'FACTOR_VAR': factor_var,
-            'SPECIFIC_VAR': specific_var,
-            'SPECIFIC_VOL': specific_vol
+            'SPECIFIC_VAR': specific_var
         })
 ```
 
 **Output Table**: `VARIANCE` (or `SPECIFIC_RISK`)
 ```
-MODEL | DATE       | SECURITY_ID | TOTAL_VAR | FACTOR_VAR | SPECIFIC_VAR | SPECIFIC_VOL
-------|------------|-------------|-----------|------------|--------------|-------------
-EDS   | 2020-03-31 | ABC123      | 0.00025   | 0.00012     | 0.00013       | 0.0114
-EDS   | 2020-03-31 | DEF456      | 0.00018   | 0.00008     | 0.00010       | 0.0100
+MODEL | DATE       | SECURITY_ID | SPECIFIC_VAR
+------|------------|-------------|--------------
+EDS   | 2020-03-31 | ABC123      | 0.00013
+EDS   | 2020-03-31 | DEF456      | 0.00010
 ...
 ```
 
-**Note**: The user mentioned "variance" table. This table contains:
-- `TOTAL_VAR`: Total variance of stock returns (60-day rolling)
-- `FACTOR_VAR`: Variance explained by factors (β^T * Σ_f * β)
-- `SPECIFIC_VAR`: Specific variance (TOTAL_VAR - FACTOR_VAR)
-- `SPECIFIC_VOL`: Specific volatility (sqrt(SPECIFIC_VAR))
+**Note**: The specific risk table contains:
+- `SPECIFIC_VAR`: Specific variance (TOTAL_VAR - FACTOR_VAR), where:
+  - TOTAL_VAR: Total variance of stock returns (60-day rolling)
+  - FACTOR_VAR: Variance explained by factors (β^T * Σ_f * β)
 
 ---
 
@@ -866,8 +859,8 @@ EDS   | Intercept                        | Market Factor
 - **Content**: Factor covariance matrix (60-day rolling window)
 
 ### 6. VARIANCE Table (Specific Risk)
-- **Columns**: MODEL, DATE, SECURITY_ID, TOTAL_VAR, FACTOR_VAR, SPECIFIC_VAR, SPECIFIC_VOL
-- **Content**: Total variance, factor variance, and specific variance/volatility for each stock
+- **Columns**: MODEL, DATE, SECURITY_ID, SPECIFIC_VAR
+- **Content**: Specific variance for each stock (calculated as total variance minus factor variance)
 
 ---
 
