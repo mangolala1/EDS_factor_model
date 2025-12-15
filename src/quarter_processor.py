@@ -622,7 +622,7 @@ def process_quarters_parallel(
         combined_exposures = combined_exposures.sort_values(['DATE', 'FACTSET_ID'])
         
         # Convert to long format (MODEL, DATE, SECURITY_ID, FACTOR_NAME, EXPOSURE)
-        from model_builder import FactorModelBuilder
+        from .model_builder import FactorModelBuilder
         combined_exposures_long = FactorModelBuilder.convert_exposures_to_long_format(combined_exposures)
         
         # Sort by DATE, SECURITY_ID, FACTOR_NAME

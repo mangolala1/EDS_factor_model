@@ -1,4 +1,2 @@
-"""
-Test suite for EDS Factor Model
-"""
+# Tests package
 
