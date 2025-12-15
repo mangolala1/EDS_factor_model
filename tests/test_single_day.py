@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from tqdm import tqdm
 import time
 
-# Add project root to path
+# Add project root to path for imports
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
@@ -301,7 +301,6 @@ def test_single_day(
                     
                     try:
                         # Process additional dates using quarter_processor
-                        # (process_quarters_parallel already imported at top of file)
                         additional_exposure_stats = process_quarters_parallel(
                             start_date=needed_start_date,
                             end_date=test_date,

@@ -273,18 +273,23 @@ class FactorModelBuilder:
         1. Factor covariance: Σ_f(T) = Cov_60(f_{.,t}) for t = T-59, ..., T
         2. Total variance: Var(r_i)_T = Var_60(r_{i,t}) for t = T-59, ..., T
         3. Factor variance: σ²_factor,i(T) = β_{i,T}^T * Σ_f(T) * β_{i,T}
-        4. Specific variance: SPECIFIC_VAR_{i,T} = max(Var(r_i)_T - σ²_factor,i(T), ε)
+        4. Specific variance: SPECIFIC_VAR_{i,T} = max(Var(r_i)_T - σ²_factor,i(T), min_floor)
+           where min_floor = max(1% of total_var, epsilon)
+        
+        Edge case handling:
+        - If factor_var >= total_var: Cap factor_var to 95% of total_var
+        - Minimum specific_var is 1% of total_var (prevents artificially low values like 1e-8)
         
         Args:
             exposures_df: DataFrame with factor exposures (index: FACTSET_ID, DATE)
             returns_df: DataFrame with stock returns (columns: FACTSET_ID, DATE, ONE_DAY_PCT)
             factor_returns_df: DataFrame with factor returns (columns: DATE, FACTOR_NAME, RETURN)
             window: Rolling window size (default: 60 days)
-            epsilon: Floor value for specific variance to avoid negatives (default: 1e-8)
+            epsilon: Minimum floor value for specific variance (default: 1e-8)
             
         Returns:
             DataFrame with columns: MODEL, DATE, SECURITY_ID, SPECIFIC_VAR
-            - SPECIFIC_VAR: Specific variance = TOTAL_VAR - FACTOR_VAR
+            - SPECIFIC_VAR: Specific variance = TOTAL_VAR - FACTOR_VAR (with reasonable floor)
         """
         print(f"  Calculating specific risk with {window}-day rolling window...")
         
@@ -428,7 +433,19 @@ class FactorModelBuilder:
                     factor_var = 0
                 
                 # 4. Calculate specific variance: max(Var(r_i)_T - σ²_factor,i(T), ε)
-                specific_var = max(total_var - factor_var, epsilon)
+                # Handle edge cases where factor variance might exceed total variance
+                # (can happen due to numerical errors, estimation issues, or when factor model
+                # explains almost all variance)
+                
+                if factor_var >= total_var:
+                    # Factor variance exceeds total variance - cap it to 95% of total variance
+                    # This leaves at least 5% as specific risk
+                    factor_var = total_var * 0.95
+                
+                # Use a more reasonable floor: 1% of total variance or epsilon, whichever is larger
+                # This prevents artificially low values (like 1e-8) while still handling edge cases
+                min_specific_var = max(total_var * 0.01, epsilon)
+                specific_var = max(total_var - factor_var, min_specific_var)
                 
                 specific_risk_list.append({
                     'MODEL': config.MODEL_NAME,
