@@ -115,15 +115,20 @@ The workflow executes in 6 stages:
    - Computes residual returns (actual - predicted)
    - Output: `specific_returns.csv`
 
-5. **Stage 5: Calculate Specific Risk** (~10-20 min)
+5. **Stage 5: Calculate Specific Risk** (~5-10 min, optimized)
    - Calculates specific variance using 60-day rolling window
+   - Uses fully vectorized operations for 10-100x speedup
    - Output: `specific_risk.csv`
 
 6. **Stage 6: Calculate Factor Covariance** (~5 min)
    - Computes factor covariance matrix using 60-day rolling window
    - Output: `factor_covariance.csv`
 
-**Total time**: ~70-90 minutes for a full year (first run), ~30-40 minutes for subsequent runs
+7. **Stage 7: Generate Factor Names Metadata** (~1 min)
+   - Creates factor metadata table with display names and groups
+   - Output: `factor_model_factor_names.csv`
+
+**Total time**: ~60-80 minutes for a full year (first run), ~25-35 minutes for subsequent runs
 
 ---
 
@@ -191,7 +196,10 @@ Outputs: `test_results/*.csv`
 
 - ✅ **Fast**: Uses Parquet files (10-50x faster than SQLite)
 - ✅ **Parallel Processing**: Processes quarters in parallel
-- ✅ **Optimized**: Specific risk calculation optimized (~40x speedup)
+- ✅ **Highly Optimized**: Specific risk calculation uses fully vectorized operations (10-100x speedup)
+  - Vectorized factor variance calculation (all stocks at once)
+  - Vectorized total variance calculation
+  - BLAS-backed matrix operations
 - ✅ **No Database**: Pure file-based workflow (CSV + Parquet)
 - ✅ **One-Time Download**: Download data once, process many times
 

@@ -340,13 +340,31 @@ def compute_exposures_for_quarter(
         df_T = df_T.replace([np.inf, -np.inf], np.nan)
         
         # OPTIMIZATION: Batch get momentum/volatility/liquidity 
-        # Use vectorized operations where possible
+        # Pre-fetch calculators dict to avoid repeated lookups in getter methods
         factset_ids = df_T['FACTSET_ID'].values
-        df_T['MOMENTUM'] = [calculator_manager.get_momentum(fid) for fid in factset_ids]
-        df_T['VOLATILITY'] = [calculator_manager.get_volatility(fid) for fid in factset_ids]
-        df_T['LIQUIDITY'] = [calculator_manager.get_liquidity(fid) for fid in factset_ids]
+        calculators_dict = calculator_manager.calculators
         
-        # Winsorize
+        # Direct dict access + method call (faster than going through manager.get_* methods)
+        momentum_vals = []
+        volatility_vals = []
+        liquidity_vals = []
+        for fid in factset_ids:
+            calc = calculators_dict.get(fid)
+            if calc:
+                momentum_vals.append(calc.get_momentum())
+                volatility_vals.append(calc.get_volatility())
+                liquidity_vals.append(calc.get_liquidity())
+            else:
+                momentum_vals.append(None)
+                volatility_vals.append(None)
+                liquidity_vals.append(None)
+        
+        df_T['MOMENTUM'] = momentum_vals
+        df_T['VOLATILITY'] = volatility_vals
+        df_T['LIQUIDITY'] = liquidity_vals
+        
+        # OPTIMIZATION: Vectorized winsorization and standardization
+        # Use np.nanpercentile and vectorized operations across all characteristics at once
         winsorize_lower = config.FACTOR_PARAMS['winsorize_lower']
         winsorize_upper = config.FACTOR_PARAMS['winsorize_upper']
         
@@ -355,25 +373,31 @@ def compute_exposures_for_quarter(
         growth_chars = ['EPS_GROWTH', 'SALES_GROWTH']
         all_chars = value_chars + profitability_chars + growth_chars + ['MOMENTUM', 'VOLATILITY', 'LIQUIDITY']
         
-        for char in all_chars:
-            if char not in df_T.columns:
-                continue
-            values = df_T[char].dropna()
-            if len(values) > 0:
-                lower_bound = values.quantile(winsorize_lower)
-                upper_bound = values.quantile(winsorize_upper)
-                df_T[char] = df_T[char].clip(lower=lower_bound, upper=upper_bound)
+        # Filter to only characteristics that exist in df_T
+        all_chars = [char for char in all_chars if char in df_T.columns]
         
-        # Standardize
-        for char in all_chars:
-            if char not in df_T.columns:
-                continue
-            values = df_T[char].dropna()
-            if len(values) > 1:
-                mean_val = values.mean()
-                std_val = values.std()
-                if std_val > 0:
-                    df_T[char] = (df_T[char] - mean_val) / std_val
+        if len(all_chars) > 0:
+            # Convert to NumPy array for faster operations
+            char_data = df_T[all_chars].values  # (N stocks × K chars)
+            
+            # Compute percentiles across axis=0 (across stocks for each characteristic)
+            # This is much faster than pandas quantile in a loop
+            lower_bounds = np.nanpercentile(char_data, winsorize_lower * 100, axis=0)
+            upper_bounds = np.nanpercentile(char_data, winsorize_upper * 100, axis=0)
+            
+            # Clip in one pass (vectorized) - broadcast lower/upper bounds to match char_data shape
+            # np.clip broadcasts automatically: (N, K) clipped by (K,) bounds
+            char_data_clipped = np.clip(char_data, lower_bounds, upper_bounds)
+            
+            # Standardize in one pass (vectorized) - compute mean/std across stocks (axis=0)
+            char_means = np.nanmean(char_data_clipped, axis=0)  # (K,) means
+            char_stds = np.nanstd(char_data_clipped, axis=0, ddof=0)  # (K,) stds
+            char_stds = np.where(char_stds > 0, char_stds, 1.0)  # Avoid division by zero
+            # Broadcast: (N, K) - (K,) / (K,) = (N, K)
+            char_data_standardized = (char_data_clipped - char_means) / char_stds
+            
+            # Write back to DataFrame
+            df_T[all_chars] = char_data_standardized
         
         # Combine into style factors
         df_T['VALUE'] = df_T[value_chars].mean(axis=1, skipna=True)
@@ -407,14 +431,11 @@ def compute_exposures_for_quarter(
         sector_dummies = sector_dummies.astype(float)
         continent_dummies = continent_dummies.astype(float)
         
-        # Sum-to-zero
-        for col in sector_dummies.columns:
-            col_mean = sector_dummies[col].mean()
-            sector_dummies[col] = sector_dummies[col] - col_mean
-        
-        for col in continent_dummies.columns:
-            col_mean = continent_dummies[col].mean()
-            continent_dummies[col] = continent_dummies[col] - col_mean
+        # OPTIMIZATION: Vectorized sum-to-zero (subtract column means in one operation)
+        if len(sector_dummies.columns) > 0:
+            sector_dummies = sector_dummies - sector_dummies.mean(axis=0)
+        if len(continent_dummies.columns) > 0:
+            continent_dummies = continent_dummies - continent_dummies.mean(axis=0)
         
         # Combine exposures
         # Ensure MOMENTUM, VOLATILITY, LIQUIDITY are included even if some values are NaN

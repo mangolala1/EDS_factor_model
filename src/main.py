@@ -213,13 +213,9 @@ def main(
                 pbar.update(1)
             if len(specific_risk_df) > 0:
                 specific_risk_df['DATE'] = pd.to_datetime(specific_risk_df['DATE']).dt.strftime('%Y-%m-%d')
-                # Save as both specific_risk.csv and variance.csv (workflow specification)
                 specific_risk_csv = output_path / 'specific_risk.csv'
-                variance_csv = output_path / 'variance.csv'
                 specific_risk_df.to_csv(specific_risk_csv, index=False)
-                specific_risk_df.to_csv(variance_csv, index=False)
                 print(f"   ✓ Saved {len(specific_risk_df):,} specific risk observations → {specific_risk_csv}")
-                print(f"   ✓ Also saved as variance.csv → {variance_csv}")
     except Exception as e:
         print(f"\n⚠ WARNING in specific risk calculation: {str(e)}")
         import traceback

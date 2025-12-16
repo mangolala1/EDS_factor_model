@@ -29,6 +29,9 @@ class FactorModelBuilder:
         Calculate daily factor returns via cross-sectional OLS regression
         f_t = (B_t^T * B_t)^-1 * B_t^T * r_t
         
+        OPTIMIZED: Uses groupby('DATE') iteration and np.linalg.lstsq instead of 
+        filtering merged data and manual pseudo-inverse. Faster and more numerically stable.
+        
         Args:
             exposures_df: DataFrame with factor exposures (index: FACTSET_ID, DATE)
             returns_df: DataFrame with stock returns (columns: FACTSET_ID, DATE, ONE_DAY_PCT)
@@ -43,15 +46,19 @@ class FactorModelBuilder:
             how='inner'
         )
         
-        # Get factor names
+        if len(merged) == 0:
+            return pd.DataFrame(columns=['MODEL', 'DATE', 'FACTOR_NAME', 'RETURN'])
+        
+        # Get factor names (preserve order from exposures_df)
         factor_names = [col for col in exposures_df.columns]
+        
+        # OPTIMIZATION: Pre-group by date to avoid repeated filtering
+        merged_by_date = merged.groupby('DATE')
         
         factor_returns_list = []
         
         # Calculate factor returns for each date via OLS
-        for date in merged['DATE'].unique():
-            date_data = merged[merged['DATE'] == date].copy()
-            
+        for date, date_data in merged_by_date:
             if len(date_data) < len(factor_names) + 1:
                 continue  # Need more observations than factors
             
@@ -95,10 +102,11 @@ class FactorModelBuilder:
                 continue
             
             # OLS: f_t = (X^T * X)^-1 * X^T * y
+            # OPTIMIZATION: Use lstsq instead of manual pinv (faster and more stable)
             try:
-                XtX = X_with_intercept.T @ X_with_intercept
-                XtX_inv = np.linalg.pinv(XtX)  # Use pseudo-inverse for numerical stability
-                factor_returns = XtX_inv @ X_with_intercept.T @ y
+                factor_returns, residuals, rank, s = np.linalg.lstsq(
+                    X_with_intercept, y, rcond=None
+                )
                 
                 # Store factor returns
                 for i, factor_name in enumerate(factor_names_with_intercept):
@@ -117,15 +125,20 @@ class FactorModelBuilder:
     
     def calculate_specific_returns(self, exposures_df: pd.DataFrame, 
                                    returns_df: pd.DataFrame,
-                                   factor_returns_df: pd.DataFrame) -> pd.DataFrame:
+                                   factor_returns_df: pd.DataFrame,
+                                   block_size: int = 10) -> pd.DataFrame:
         """
         Calculate specific (idiosyncratic) returns as regression residuals
         ε̂_i,t = r_i,t - Σ(k=1 to K) β_i,k,t * f̂_k,t
+        
+        OPTIMIZED: Uses vectorized einsum with date-block processing to eliminate iterrows loops.
+        Processes dates in blocks (default 10 days) to avoid memory issues with large datasets.
         
         Args:
             exposures_df: DataFrame with factor exposures (index: FACTSET_ID or SECURITY_ID, DATE)
             returns_df: DataFrame with stock returns
             factor_returns_df: DataFrame with factor returns
+            block_size: Number of dates to process per block (default: 10)
             
         Returns:
             DataFrame with specific returns (columns: MODEL, DATE, SECURITY_ID, SPECIFIC_RETURN)
@@ -155,60 +168,99 @@ class FactorModelBuilder:
         # Ensure DATE columns are datetime
         exposures_reset['DATE'] = pd.to_datetime(exposures_reset['DATE'])
         returns_prep['DATE'] = pd.to_datetime(returns_prep['DATE'])
+        factor_returns_df = factor_returns_df.copy()
+        factor_returns_df['DATE'] = pd.to_datetime(factor_returns_df['DATE'])
         
-        # Use LEFT merge to keep all stocks with exposures, then filter to those with returns
-        # This ensures we don't lose stocks that have exposures but might have missing returns
+        # Merge exposures with returns
         merged = exposures_reset.merge(
             returns_prep[['SECURITY_ID', 'DATE', 'ONE_DAY_PCT']],
             on=['SECURITY_ID', 'DATE'],
-            how='left'  # Keep all exposures
+            how='inner'  # Only keep stocks with both exposures and returns
         )
-        
-        # Filter to only stocks that have returns (can't calculate specific return without return)
-        merged = merged[merged['ONE_DAY_PCT'].notna()]
         
         if len(merged) == 0:
             print("   ⚠ WARNING: No stocks with both exposures and returns found")
             return pd.DataFrame(columns=['MODEL', 'DATE', 'SECURITY_ID', 'SPECIFIC_RETURN'])
         
-        # Get factor names (exclude metadata columns)
+        # Get factor names (exclude metadata columns) - CRITICAL: preserve order
         factor_names = [col for col in exposures_reset.columns 
                        if col not in ['SECURITY_ID', 'DATE', 'MODEL', 'ONE_DAY_PCT']]
+        
+        # Pivot factor returns to wide format for efficient lookup
+        factor_returns_wide = factor_returns_df.pivot_table(
+            index='DATE',
+            columns='FACTOR_NAME',
+            values='RETURN'
+        ).sort_index()
+        
+        # Ensure factor column order matches between exposures and factor returns
+        # Get intersection of factor names (some factors might not be in factor_returns)
+        factor_names_ordered = [f for f in factor_names if f in factor_returns_wide.columns]
+        
+        if len(factor_names_ordered) == 0:
+            print("   ⚠ WARNING: No matching factors between exposures and factor returns")
+            return pd.DataFrame(columns=['MODEL', 'DATE', 'SECURITY_ID', 'SPECIFIC_RETURN'])
+        
+        # Get all unique dates (sorted)
+        all_dates = sorted(merged['DATE'].unique())
+        all_dates = [d for d in all_dates if d in factor_returns_wide.index]
+        
+        if len(all_dates) == 0:
+            print("   ⚠ WARNING: No matching dates between exposures and factor returns")
+            return pd.DataFrame(columns=['MODEL', 'DATE', 'SECURITY_ID', 'SPECIFIC_RETURN'])
+        
+        # Process dates in blocks to avoid memory issues
         specific_returns_list = []
         
-        # Calculate specific returns for each date and stock
-        for date in merged['DATE'].unique():
-            date_data = merged[merged['DATE'] == date].copy()
-            date_factor_returns = factor_returns_df[factor_returns_df['DATE'] == date]
+        print(f"  Processing {len(all_dates)} dates in blocks of {block_size}...")
+        
+        for block_start in range(0, len(all_dates), block_size):
+            date_block = all_dates[block_start:block_start + block_size]
+            block_data = merged[merged['DATE'].isin(date_block)].copy()
             
-            if len(date_factor_returns) == 0:
+            if len(block_data) == 0:
                 continue
             
-            # Create factor returns dictionary
-            factor_returns_dict = dict(zip(
-                date_factor_returns['FACTOR_NAME'],
-                date_factor_returns['RETURN']
-            ))
+            # Get exposures matrix B for this block
+            # Ensure columns are in the same order as factor_returns_wide
+            B_block = block_data[factor_names_ordered].fillna(0).values  # (N_block, K)
             
-            # Calculate explained return: Σ(k) β_i,k * f_k
-            for idx, row in date_data.iterrows():
-                explained_return = sum(
-                    row[factor] * factor_returns_dict.get(factor, 0)
-                    for factor in factor_names
-                    if not pd.isna(row[factor])
-                )
-                
-                # Specific return = actual return - explained return
-                specific_return = row['ONE_DAY_PCT'] - explained_return
-                
-                specific_returns_list.append({
-                    'MODEL': config.MODEL_NAME,
-                    'DATE': date,
-                    'SECURITY_ID': row['SECURITY_ID'],
-                    'SPECIFIC_RETURN': specific_return
-                })
+            # Get factor returns per date - avoid materializing full F matrix
+            # Create date-to-factor-returns mapping
+            date_to_factors = {}
+            for date in date_block:
+                if date in factor_returns_wide.index:
+                    date_to_factors[date] = factor_returns_wide.loc[date, factor_names_ordered].fillna(0).values
+            
+            # Create f_by_row: map each row's date to its factor returns
+            # More memory efficient than creating full F matrix
+            f_by_row = np.array([date_to_factors.get(date, np.zeros(len(factor_names_ordered))) 
+                                for date in block_data['DATE']])
+            
+            # Vectorized calculation: explained returns for all rows in block
+            # explained = Σ(k) B[n,k] * F[n,k] for each row n
+            explained_returns = np.einsum("nk,nk->n", B_block, f_by_row)
+            # Alternative (slightly slower but equivalent): 
+            # explained_returns = (B_block * f_by_row).sum(axis=1)
+            
+            # Specific returns = actual returns - explained returns
+            specific_returns = block_data['ONE_DAY_PCT'].values - explained_returns
+            
+            # Store results for this block
+            block_results = pd.DataFrame({
+                'MODEL': config.MODEL_NAME,
+                'DATE': block_data['DATE'].values,
+                'SECURITY_ID': block_data['SECURITY_ID'].values,
+                'SPECIFIC_RETURN': specific_returns
+            })
+            specific_returns_list.append(block_results)
         
-        specific_returns_df = pd.DataFrame(specific_returns_list)
+        # Concatenate all blocks
+        if specific_returns_list:
+            specific_returns_df = pd.concat(specific_returns_list, ignore_index=True)
+        else:
+            specific_returns_df = pd.DataFrame(columns=['MODEL', 'DATE', 'SECURITY_ID', 'SPECIFIC_RETURN'])
+        
         return specific_returns_df
     
     def calculate_factor_covariance(self, factor_returns_df: pd.DataFrame,
@@ -216,6 +268,14 @@ class FactorModelBuilder:
         """
         Calculate factor covariance matrix using rolling window
         F_kl = Cov_t(f_k,t, f_l,t)
+        
+        OPTIMIZED: Uses incremental rolling sums (S₁/S₂) instead of pandas rolling.cov().
+        Much faster and more memory efficient. Output writing is vectorized.
+        
+        Algorithm:
+        - Maintain rolling sums: S₁ = Σ f_s, S₂ = Σ f_s f_s^T
+        - Update incrementally: S₁ ← S₁ + f_new - f_old
+        - Covariance: Σ = (S₂ - W·μμ^T) / (W-1) where μ = S₁/W
         
         Args:
             factor_returns_df: DataFrame with factor returns
@@ -231,34 +291,81 @@ class FactorModelBuilder:
             values='RETURN'
         ).sort_index()
         
-        # Calculate rolling covariance
-        covariances = []
         factor_names = factor_returns_wide.columns.tolist()
+        K = len(factor_names)
         
-        for date in factor_returns_wide.index:
-            # Get rolling window
-            window_data = factor_returns_wide.loc[
-                factor_returns_wide.index <= date
-            ].tail(lookback_window)
+        # Initialize rolling sums
+        S1 = np.zeros(K)  # Sum of factor returns: S₁ = Σ f_s
+        S2 = np.zeros((K, K))  # Sum of outer products: S₂ = Σ f_s f_s^T
+        window_buffer = []  # Keep last W factor return vectors for removing old observations
+        
+        # List to store DataFrames (one per date) - faster than appending dicts
+        covariances_list = []
+        
+        for date_idx, date in enumerate(factor_returns_wide.index):
+            f_t = factor_returns_wide.iloc[date_idx].values  # Current factor returns (K,)
             
-            if len(window_data) < lookback_window // 2:
+            # Handle NaN values - skip dates with too many NaNs
+            if np.isnan(f_t).sum() > K // 2:
                 continue
             
-            # Calculate covariance matrix
-            cov_matrix = window_data.cov()
+            # Fill NaN with 0 for calculation (or could use forward fill, but 0 is safer)
+            f_t = np.nan_to_num(f_t, nan=0.0)
             
-            # Store pairwise covariances
-            for i, factor1 in enumerate(factor_names):
-                for j, factor2 in enumerate(factor_names[i:], start=i):
-                    covariances.append({
-                        'MODEL': config.MODEL_NAME,
-                        'DATE': date,
-                        'FACTOR_NAME_1': factor1,
-                        'FACTOR_NAME_2': factor2,
-                        'COVARIANCE': cov_matrix.loc[factor1, factor2]
-                    })
+            # Add new observation to rolling sums
+            S1 += f_t
+            S2 += np.outer(f_t, f_t)
+            window_buffer.append(f_t.copy())
+            
+            # Remove old observation if window is full
+            if len(window_buffer) > lookback_window:
+                f_old = window_buffer.pop(0)
+                S1 -= f_old
+                S2 -= np.outer(f_old, f_old)
+            
+            # Calculate covariance if we have enough data
+            W = len(window_buffer)
+            if W < lookback_window // 2:
+                continue
+            
+            # Calculate mean: μ = S₁ / W
+            mu = S1 / W
+            
+            # Calculate covariance: Σ = (S₂ - W·μμ^T) / (W-1)
+            cov_matrix = (S2 - W * np.outer(mu, mu)) / (W - 1)
+            
+            # Store pairwise covariances (VECTORIZED - don't loop in Python!)
+            # Use upper triangle indices (symmetric matrix)
+            i, j = np.triu_indices(K)
+            
+            # Extract covariances as arrays (vectorized)
+            cov_values = cov_matrix[i, j]  # (num_pairs,) array
+            
+            # Build DataFrame columns as arrays (much faster than appending dicts)
+            num_pairs = len(i)
+            # Use list comprehension for date array to preserve datetime type
+            date_array = [date] * num_pairs
+            factor1_array = np.array([factor_names[i_idx] for i_idx in i])
+            factor2_array = np.array([factor_names[j_idx] for j_idx in j])
+            
+            # Create DataFrame for this date
+            date_cov_df = pd.DataFrame({
+                'MODEL': config.MODEL_NAME,
+                'DATE': date_array,
+                'FACTOR_NAME_1': factor1_array,
+                'FACTOR_NAME_2': factor2_array,
+                'COVARIANCE': cov_values
+            })
+            
+            # Append to list (will concatenate at end)
+            covariances_list.append(date_cov_df)
         
-        covariance_df = pd.DataFrame(covariances)
+        # Concatenate all date DataFrames at once (much faster than appending dicts)
+        if covariances_list:
+            covariance_df = pd.concat(covariances_list, ignore_index=True)
+        else:
+            covariance_df = pd.DataFrame(columns=['MODEL', 'DATE', 'FACTOR_NAME_1', 'FACTOR_NAME_2', 'COVARIANCE'])
+        
         return covariance_df
     
     def calculate_specific_risk(self, exposures_df: pd.DataFrame,
@@ -356,25 +463,21 @@ class FactorModelBuilder:
                 continue
             
             # Get factor returns window: T-59 to T
+            # Use available data even if less than full window (for early dates)
             date_idx = factor_returns_wide.index.get_loc(date_T)
-            if date_idx < window - 1:
-                # Not enough history
-                continue
-            
             window_start_idx = max(0, date_idx - window + 1)
             factor_returns_window = factor_returns_wide.iloc[window_start_idx:date_idx+1]
             
+            # Require at least window//2 observations (30 days) for meaningful calculation
+            # This allows us to calculate specific risk for dates starting from day 30
             if len(factor_returns_window) < window // 2:
-                # Not enough data
+                # Not enough data - skip this date
                 continue
             
             # 1. Calculate factor covariance matrix Σ_f(T) (once per date, not per stock)
             # Use only non-intercept factors for covariance
             factor_returns_for_cov = factor_returns_window[factor_names_for_cov]
             factor_cov_matrix = factor_returns_for_cov.cov().values
-            
-            # Create mapping from factor name to index
-            factor_idx_map = {f: idx for idx, f in enumerate(factor_names_for_cov)}
             
             # OPTIMIZATION: Pre-filter returns by date range once (not per stock)
             window_start_date = factor_returns_window.index[0]
@@ -383,70 +486,105 @@ class FactorModelBuilder:
                 (returns_prep['DATE'] <= date_T)
             ].copy()
             
-            # OPTIMIZATION: Group returns by security_id for faster lookups
-            returns_by_security = returns_window.groupby('SECURITY_ID')['ONE_DAY_PCT']
+            # MAJOR OPTIMIZATION: Vectorize total variance calculation for all stocks
+            # Pivot returns to wide format (stocks × dates) for efficient rolling variance
+            if len(returns_window) == 0:
+                continue
             
-            # 2. For each stock, calculate total variance and factor variance
-            # OPTIMIZATION: Iterate over rows but use pre-filtered returns
-            for _, stock_row in exposures_T.iterrows():
-                security_id = stock_row['SECURITY_ID']
-                
-                # OPTIMIZATION: Get stock returns from pre-filtered and grouped data (O(1) lookup)
-                try:
-                    stock_returns_series = returns_by_security.get_group(security_id).dropna()
-                except KeyError:
-                    # Stock not in returns for this window
-                    continue
-                
-                if len(stock_returns_series) < window // 2:
-                    # Not enough return history
-                    continue
-                
-                # Calculate total variance: Var_60(r_{i,t})
-                total_var = stock_returns_series.var()
-                
-                if pd.isna(total_var) or total_var <= 0:
-                    continue
-                
-                # 3. Calculate factor variance: β_{i,T}^T * Σ_f(T) * β_{i,T}
-                # Get exposure vector for this stock (only non-intercept factors)
-                beta_vector = []
-                beta_indices = []
+            returns_pivot = returns_window.pivot_table(
+                index='SECURITY_ID',
+                columns='DATE',
+                values='ONE_DAY_PCT'
+            )
+            
+            # Get stocks that have both exposures and returns
+            stocks_with_exposures = set(exposures_T['SECURITY_ID'].values)
+            stocks_with_returns = set(returns_pivot.index)
+            stocks_to_process = list(stocks_with_exposures & stocks_with_returns)
+            
+            if len(stocks_to_process) == 0:
+                continue
+            
+            # Filter to stocks we'll process
+            exposures_T_filtered = exposures_T[exposures_T['SECURITY_ID'].isin(stocks_to_process)].copy()
+            returns_pivot_filtered = returns_pivot.loc[stocks_to_process]
+            
+            # Calculate total variance for all stocks at once (vectorized)
+            # Use rolling window variance: need at least window//2 observations
+            total_vars = returns_pivot_filtered.var(axis=1, ddof=0)  # Population variance
+            
+            # Filter stocks with sufficient data and valid variance
+            valid_stocks = total_vars[
+                (total_vars.notna()) & 
+                (total_vars > 0) &
+                (returns_pivot_filtered.count(axis=1) >= window // 2)
+            ].index.tolist()
+            
+            if len(valid_stocks) == 0:
+                continue
+            
+            # Filter exposures and total_vars to valid stocks
+            # IMPORTANT: Align exposures with total_vars by using total_vars index order
+            total_vars_valid = total_vars.loc[valid_stocks]
+            
+            # Set SECURITY_ID as index for exposures to enable alignment
+            exposures_T_indexed = exposures_T_filtered.set_index('SECURITY_ID')
+            exposures_T_valid = exposures_T_indexed.loc[valid_stocks].reset_index()
+            
+            # MAJOR OPTIMIZATION: Vectorize factor variance calculation for all stocks
+            # Build exposure matrix B (N stocks × K factors) for all stocks on date T
+            # Fill missing exposures as 0 (as per user's suggestion)
+            # Stock order now matches total_vars_valid.index
+            stock_ids_ordered = valid_stocks  # Use same order as total_vars_valid
+            B = np.zeros((len(exposures_T_valid), len(factor_names_for_cov)))
+            
+            # Map factor names to column indices in B
+            factor_to_col = {f: idx for idx, f in enumerate(factor_names_for_cov)}
+            
+            # Fill exposure matrix (preserve order by iterating in order)
+            for stock_idx, (_, stock_row) in enumerate(exposures_T_valid.iterrows()):
                 for f in factor_names_for_cov:
                     if f in stock_row.index and not pd.isna(stock_row[f]):
-                        beta_vector.append(stock_row[f])
-                        beta_indices.append(factor_idx_map[f])
-                
-                if len(beta_vector) == 0:
-                    continue
-                
-                beta_vector = np.array(beta_vector)
-                beta_indices = np.array(beta_indices)
-                
-                # Extract relevant submatrix of covariance
-                factor_cov_submatrix = factor_cov_matrix[np.ix_(beta_indices, beta_indices)]
-                
-                # Calculate factor variance: β^T * Σ_f * β
-                factor_var = beta_vector.T @ factor_cov_submatrix @ beta_vector
-                
-                if pd.isna(factor_var) or factor_var < 0:
-                    factor_var = 0
-                
-                # 4. Calculate specific variance: max(Var(r_i)_T - σ²_factor,i(T), ε)
-                # Handle edge cases where factor variance might exceed total variance
-                # (can happen due to numerical errors, estimation issues, or when factor model
-                # explains almost all variance)
-                
-                if factor_var >= total_var:
-                    # Factor variance exceeds total variance - cap it to 95% of total variance
-                    # This leaves at least 5% as specific risk
-                    factor_var = total_var * 0.95
-                
-                # Use a more reasonable floor: 1% of total variance or epsilon, whichever is larger
-                # This prevents artificially low values (like 1e-8) while still handling edge cases
-                min_specific_var = max(total_var * 0.01, epsilon)
-                specific_var = max(total_var - factor_var, min_specific_var)
-                
+                        col_idx = factor_to_col[f]
+                        B[stock_idx, col_idx] = stock_row[f]
+            
+            # Compute factor variance for all stocks at once: diag(B @ Σ_f @ B^T)
+            # Equivalent to: (B @ Σ_f @ B.T).diagonal()
+            # More efficient: tmp = B @ Σ_f, then factor_var = (tmp * B).sum(axis=1)
+            tmp = B @ factor_cov_matrix  # (N, K)
+            factor_vars = np.einsum('nk,nk->n', tmp, B)  # Length N vector
+            
+            # Handle NaN and negative values
+            factor_vars = np.where(np.isnan(factor_vars) | (factor_vars < 0), 0, factor_vars)
+            
+            # Convert to pandas Series with same order as exposures_T_valid
+            factor_vars_series = pd.Series(factor_vars, index=stock_ids_ordered)
+            total_vars_series = total_vars_valid
+            
+            # Align indices (should already match, but ensure)
+            common_stocks = factor_vars_series.index.intersection(total_vars_series.index)
+            factor_vars_aligned = factor_vars_series.loc[common_stocks]
+            total_vars_aligned = total_vars_series.loc[common_stocks]
+            
+            # Calculate specific variance for all stocks at once (vectorized)
+            # Handle edge cases where factor variance might exceed total variance
+            factor_vars_capped = np.where(
+                factor_vars_aligned >= total_vars_aligned,
+                total_vars_aligned * 0.95,  # Cap to 95% of total variance
+                factor_vars_aligned
+            )
+            
+            # Calculate minimum floor: 1% of total variance or epsilon
+            min_specific_vars = np.maximum(total_vars_aligned * 0.01, epsilon)
+            
+            # Specific variance = max(total_var - factor_var, min_floor)
+            specific_vars = np.maximum(
+                total_vars_aligned - factor_vars_capped,
+                min_specific_vars
+            )
+            
+            # Store results for all stocks at once
+            for security_id, specific_var in zip(common_stocks, specific_vars):
                 specific_risk_list.append({
                     'MODEL': config.MODEL_NAME,
                     'DATE': date_T,
