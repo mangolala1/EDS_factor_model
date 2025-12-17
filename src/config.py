@@ -17,18 +17,10 @@ SNOWFLAKE_CONFIG = {
     'role': os.getenv('SNOWFLAKE_ROLE', '')
 }
 
-# Model Parameters
-TARGET_CORRELATION = 0.70  # Minimum correlation with S&P500
-LOOKBACK_PERIOD = 252  # Trading days (1 year)
-MIN_DATA_POINTS = 60  # Minimum data points required for factor calculation
-
 # Data Filtering Parameters (to avoid memory issues)
 MAX_STOCKS = 500  # Maximum number of stocks to process (set to None for all stocks)
 # If you have memory issues, reduce this number (e.g., 500, 1000, 5000)
 # The code will randomly sample stocks if universe exceeds this limit
-
-# S&P500 Ticker
-SP500_TICKER = '^GSPC'
 
 # Snowflake Table Names
 SNOWFLAKE_TABLES = {
@@ -38,13 +30,6 @@ SNOWFLAKE_TABLES = {
     'exchange_rates': 'EXCHANGERATES',
     'market_value': 'MARKET_VALUE_HISTORY',
     'enterprise_value': 'ENTERPRISEVALUE_HISTORY'
-}
-
-# Exposure pipeline settings
-EXPOSURE_PIPELINE = {
-    'max_workers': None,          # Default: auto-detect (CPU cores - 1)
-    'window_cache_size': 64,      # Rolling window cache size for per-date slices
-    'progress_interval': 25       # How frequently to print progress updates
 }
 
 # Factor Construction Parameters (MSCI-style)

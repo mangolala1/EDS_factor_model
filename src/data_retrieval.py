@@ -3,16 +3,11 @@ Data retrieval module for fetching data from Snowflake
 """
 import snowflake.connector
 import pandas as pd
-import yfinance as yf
 from typing import Optional, Dict, List
 from datetime import datetime, timedelta
 from . import config
 import os
 from tqdm import tqdm
-
-
-# Note: load_ticker_list function removed - we now use all stocks in the universe
-# If ticker filtering is needed in the future, this function can be restored
 
 
 class SnowflakeDataRetriever:
@@ -340,8 +335,7 @@ class SnowflakeDataRetriever:
                     ADJUSTED_PRICE_DAY_LOW,
                     CURRENCY,
                     P_DIVS_PD,
-                    P_SPLIT_FACTOR,
-                    IS_HOLIDAY
+                    P_SPLIT_FACTOR
                 FROM {table_name}
                 WHERE DATE >= '{effective_start_date}' AND DATE <= '{end_date}'
                 {factset_filter}
@@ -357,7 +351,7 @@ class SnowflakeDataRetriever:
                 return pd.DataFrame(columns=['FACTSET_ID', 'DATE', 'SPLIT_FACTOR', 'SPECIAL_DIVS_FACTOR',
                                             'UNADJUSTED_PRICE', 'ADJUSTED_PRICE', 'ADJUSTED_VOLUME',
                                             'ADJUSTED_PRICE_DAY_HIGH', 'ADJUSTED_PRICE_DAY_LOW', 'CURRENCY',
-                                            'P_DIVS_PD', 'P_SPLIT_FACTOR', 'IS_HOLIDAY'])
+                                            'P_DIVS_PD', 'P_SPLIT_FACTOR'])
         else:
             factset_filter = ""
             if factset_ids:
@@ -377,8 +371,7 @@ class SnowflakeDataRetriever:
                 ADJUSTED_PRICE_DAY_LOW,
                 CURRENCY,
                 P_DIVS_PD,
-                P_SPLIT_FACTOR,
-                IS_HOLIDAY
+                P_SPLIT_FACTOR
             FROM {table_name}
             WHERE DATE >= '{min_date}' AND DATE <= '{end_date}'
             {factset_filter}
@@ -426,17 +419,56 @@ class SnowflakeDataRetriever:
         print(f"   Executing query (this may take a few minutes for large date ranges)...")
         return self.execute_query(query)
     
-    def get_prices_data_by_date_range(self, start_date: str, end_date: str) -> pd.DataFrame:
+    def get_exchange_rates_by_date_range(self, start_date: str, end_date: str) -> pd.DataFrame:
         """
-        Retrieve prices data for full universe by date range (no factset_ids filtering)
-        This queries all stocks for the given date range, excluding holidays
+        Retrieve exchange rates for full date range (no filtering)
         
         Args:
             start_date: Start date in 'YYYY-MM-DD' format (minimum enforced: '2015-01-01')
             end_date: End date in 'YYYY-MM-DD' format
             
         Returns:
-            DataFrame with price data for all stocks in the date range (excluding holiday rows)
+            DataFrame with exchange rates for all currencies in the date range
+        """
+        return self.get_exchange_rates(start_date, end_date)
+    
+    def get_market_value_data_by_date_range(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        Retrieve market value data for full universe by date range (no factset_ids filtering)
+        
+        Args:
+            start_date: Start date in 'YYYY-MM-DD' format (minimum enforced: '2015-01-01')
+            end_date: End date in 'YYYY-MM-DD' format
+            
+        Returns:
+            DataFrame with market value data for all stocks in the date range
+        """
+        return self.get_market_value_data(start_date, end_date, factset_ids=None)
+    
+    def get_enterprise_value_data_by_date_range(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        Retrieve enterprise value data for full universe by date range (no factset_ids filtering)
+        
+        Args:
+            start_date: Start date in 'YYYY-MM-DD' format (minimum enforced: '2015-01-01')
+            end_date: End date in 'YYYY-MM-DD' format
+            
+        Returns:
+            DataFrame with enterprise value data for all stocks in the date range
+        """
+        return self.get_enterprise_value_data(start_date, end_date, factset_ids=None)
+    
+    def get_prices_data_by_date_range(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        Retrieve prices data for full universe by date range (no factset_ids filtering)
+        Data only contains trading days (no weekends/holidays)
+        
+        Args:
+            start_date: Start date in 'YYYY-MM-DD' format (minimum enforced: '2015-01-01')
+            end_date: End date in 'YYYY-MM-DD' format
+            
+        Returns:
+            DataFrame with price data for all stocks in the date range (trading days only)
         """
         # Enforce minimum date of 2015-01-01
         min_date = '2015-01-01'
@@ -457,11 +489,9 @@ class SnowflakeDataRetriever:
             ADJUSTED_PRICE_DAY_LOW,
             CURRENCY,
             P_DIVS_PD,
-            P_SPLIT_FACTOR,
-            IS_HOLIDAY
+            P_SPLIT_FACTOR
         FROM {table_name}
         WHERE DATE >= '{effective_start_date}' AND DATE <= '{end_date}'
-          AND IS_HOLIDAY = FALSE
         ORDER BY DATE, FACTSET_ID
         """
         
@@ -659,7 +689,8 @@ class SnowflakeDataRetriever:
             SELECT 
                 DATE,
                 CURRENCYCODE,
-                EXCHANGERATE
+                EXCHANGERATE,
+                LAG_EXCHANGERATE
             FROM {table_name}
             WHERE DATE >= '{min_date}' AND DATE <= '{end_date}'
             ORDER BY DATE, CURRENCYCODE
@@ -678,7 +709,7 @@ class SnowflakeDataRetriever:
             print("You may need to provide exchange rates manually or ensure the table exists.")
             print("Note: Enterprise value is in USD, but market value is in local currency.")
             print("      Currency conversion will be needed for market value calculations.")
-            return pd.DataFrame(columns=['DATE', 'CURRENCY', 'EXCHANGE_RATE_TO_USD'])
+            return pd.DataFrame(columns=['DATE', 'CURRENCY', 'EXCHANGE_RATE_TO_USD', 'LAG_EXCHANGERATE'])
     
     def get_market_value_data(self, start_date: str, end_date: str, 
                               factset_ids: List[str] = None) -> pd.DataFrame:
@@ -757,53 +788,6 @@ class SnowflakeDataRetriever:
         
         return self.execute_query(query)
     
-    def get_sp500_returns(self, start_date: str, end_date: str) -> pd.Series:
-        """
-        Get S&P500 returns from Yahoo Finance
-        
-        Args:
-            start_date: Start date in 'YYYY-MM-DD' format
-            end_date: End date in 'YYYY-MM-DD' format
-            
-        Returns:
-            Series with daily returns
-        """
-        sp500 = yf.download(config.SP500_TICKER, start=start_date, end=end_date)
-        returns = sp500['Adj Close'].pct_change().dropna()
-        returns.name = 'sp500_returns'
-        return returns
-    
-    def is_holiday_date(self, date: str) -> bool:
-        """
-        Check if a given date is a holiday (all rows have IS_HOLIDAY=True)
-        
-        Args:
-            date: Date in 'YYYY-MM-DD' format
-            
-        Returns:
-            True if date is a holiday (should be skipped), False otherwise
-        """
-        table_name = f'"{config.SNOWFLAKE_CONFIG["database"]}"."{config.SNOWFLAKE_CONFIG["schema"]}".{config.SNOWFLAKE_TABLES["prices"]}'
-        
-        query = f"""
-        SELECT DISTINCT IS_HOLIDAY
-        FROM {table_name}
-        WHERE DATE = '{date}'
-        """
-        
-        result = self.execute_query(query)
-        
-        # If no data for this date, skip it
-        if len(result) == 0:
-            return True  # Skip dates with no data
-        
-        # If all rows have IS_HOLIDAY=True, it's a holiday
-        if len(result) == 1 and result['IS_HOLIDAY'].iloc[0] == True:
-            return True
-        
-        # If there are any rows with IS_HOLIDAY=False, it's not a holiday
-        return False
-    
     def get_data_for_date(self, date: str) -> Dict[str, pd.DataFrame]:
         """
         Retrieve all data for a single date from Snowflake
@@ -814,24 +798,10 @@ class SnowflakeDataRetriever:
         Returns:
             Dictionary with keys: 'fundamentals', 'prices', 'universe', 'returns', 
                                   'market_value', 'enterprise_value'
-            Returns empty DataFrames if date is a holiday or has no data
+            Returns empty DataFrames if date has no data
         """
-        # Check if date is a holiday
-        if self.is_holiday_date(date):
-            return {
-                'fundamentals': pd.DataFrame(),
-                'prices': pd.DataFrame(),
-                'universe': pd.DataFrame(),
-                'returns': pd.DataFrame(),
-                'market_value': pd.DataFrame(),
-                'enterprise_value': pd.DataFrame()
-            }
-        
-        # Get prices for this date (filter out holiday rows)
+        # Get prices for this date
         prices_df = self.get_prices_data(date, date)
-        if len(prices_df) > 0:
-            # Filter out holiday rows
-            prices_df = prices_df[prices_df['IS_HOLIDAY'] == False]
         
         if len(prices_df) == 0:
             # No valid data for this date
@@ -883,14 +853,15 @@ class SnowflakeDataRetriever:
     
     def get_trading_dates(self, start_date: str, end_date: str) -> List[str]:
         """
-        Get list of trading dates (non-holiday dates) between start_date and end_date
+        Get list of trading dates between start_date and end_date
+        (Data only contains trading days, so no filtering needed)
         
         Args:
             start_date: Start date in 'YYYY-MM-DD' format
             end_date: End date in 'YYYY-MM-DD' format
             
         Returns:
-            List of dates in 'YYYY-MM-DD' format (excluding holidays)
+            List of dates in 'YYYY-MM-DD' format
         """
         table_name = f'"{config.SNOWFLAKE_CONFIG["database"]}"."{config.SNOWFLAKE_CONFIG["schema"]}".{config.SNOWFLAKE_TABLES["prices"]}'
         
@@ -898,7 +869,6 @@ class SnowflakeDataRetriever:
         SELECT DISTINCT DATE
         FROM {table_name}
         WHERE DATE >= '{start_date}' AND DATE <= '{end_date}'
-          AND IS_HOLIDAY = FALSE
         ORDER BY DATE
         """
         

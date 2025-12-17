@@ -11,17 +11,16 @@ from . import config
 class FactorModelBuilder:
     """Class to build factor model and calculate risk metrics"""
     
-    def __init__(self, factors_df: pd.DataFrame, sp500_returns: pd.Series = None):
+    def __init__(self, factors_df: pd.DataFrame = None, sp500_returns: pd.Series = None):
         """
         Initialize factor model builder
         
         Args:
-            factors_df: DataFrame with factor exposures (used for structure, not directly)
-            sp500_returns: Optional Series with S&P500 returns (currently unused, kept for compatibility)
+            factors_df: Optional DataFrame with factor exposures (not directly used, kept for compatibility)
+            sp500_returns: Optional Series with S&P500 returns (not used, kept for compatibility)
         """
-        # Store factors_df for compatibility, though it's not directly used in current implementation
-        self.factors_df = factors_df.copy() if factors_df is not None else pd.DataFrame()
-        self.sp500_returns = sp500_returns.copy() if sp500_returns is not None else pd.Series(dtype=float)
+        # Parameters kept for backward compatibility but not used in current implementation
+        pass
     
     def calculate_daily_factor_returns(self, exposures_df: pd.DataFrame, 
                                        returns_df: pd.DataFrame) -> pd.DataFrame:

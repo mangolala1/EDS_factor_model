@@ -139,7 +139,7 @@ def main(
         # Calculate factor returns
         print("Calculating factor returns...")
         with tqdm(total=1, desc="Factor returns", bar_format='{desc}: {elapsed}') as pbar:
-            model_builder = FactorModelBuilder(exposures_df, pd.Series(dtype=float))
+            model_builder = FactorModelBuilder()
             factor_returns_df = model_builder.calculate_daily_factor_returns(
                 exposures_df=exposures_df,
                 returns_df=returns_df

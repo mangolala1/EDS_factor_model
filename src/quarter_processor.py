@@ -64,7 +64,10 @@ def compute_exposures_for_quarter(
     fundamentals_path: Path,
     start_date: str,
     end_date: str,
-    neutralize: bool = False
+    neutralize: bool = False,
+    market_value_path: Optional[Path] = None,
+    exchange_rates_path: Optional[Path] = None,
+    enterprise_value_path: Optional[Path] = None
 ) -> Dict:
     """
     Process all dates in a quarter
@@ -96,14 +99,21 @@ def compute_exposures_for_quarter(
             if batch_count % 10 == 0:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Processed {batch_count} price batches...")
             chunk_df = batch.to_pandas()
+            
+            # Reset index to avoid duplicate label issues
+            chunk_df = chunk_df.reset_index(drop=True)
+            
             chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
-            filtered = chunk_df[
-                (chunk_df['DATE'] >= lookback_start_dt) & 
-                (chunk_df['DATE'] <= quarter_end_dt)
-            ]
+            # Filter by date range (data only contains trading days)
+            date_mask = (chunk_df['DATE'].values >= lookback_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
+            filtered = chunk_df.iloc[date_mask].copy()
+            
             if len(filtered) > 0:
                 prices_chunks.append(filtered)
         all_prices = pd.concat(prices_chunks, ignore_index=True) if prices_chunks else pd.DataFrame()
+        # Remove duplicate columns after concatenation
+        if len(all_prices) > 0:
+            all_prices = all_prices.loc[:, ~all_prices.columns.duplicated()]
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loaded {len(all_prices):,} price rows in {time.time() - prices_start:.1f}s")
     except Exception as e:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error loading prices for {year}Q{quarter}: {e}")
@@ -124,20 +134,46 @@ def compute_exposures_for_quarter(
             if batch_count % 10 == 0:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Processed {batch_count} return batches...")
             chunk_df = batch.to_pandas()
+            
+            # Reset index to avoid duplicate label issues - ensure simple integer index
+            chunk_df = chunk_df.reset_index(drop=True)
+            
+            # Remove duplicate column names first
+            chunk_df = chunk_df.loc[:, ~chunk_df.columns.duplicated()]
+            
             if 'FSYM_ID' in chunk_df.columns:
                 chunk_df = chunk_df.rename(columns={'FSYM_ID': 'FACTSET_ID'})
+            
+            # Handle DATE column - prefer P_DATE if both exist
             if 'P_DATE' in chunk_df.columns:
                 chunk_df['P_DATE'] = pd.to_datetime(chunk_df['P_DATE'])
+                # If DATE also exists, drop it first to avoid duplicates
+                if 'DATE' in chunk_df.columns:
+                    chunk_df = chunk_df.drop(columns=['DATE'])
                 chunk_df = chunk_df.rename(columns={'P_DATE': 'DATE'})
             elif 'DATE' in chunk_df.columns:
                 chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
-            filtered = chunk_df[
-                (chunk_df['DATE'] >= lookback_start_dt) & 
-                (chunk_df['DATE'] <= quarter_end_dt)
-            ]
+            
+            # Check if DATE column exists
+            if 'DATE' not in chunk_df.columns:
+                continue
+            
+            # Ensure DATE is a single column (not DataFrame)
+            if isinstance(chunk_df['DATE'], pd.DataFrame):
+                chunk_df['DATE'] = chunk_df['DATE'].iloc[:, 0]
+            
+            # Create boolean mask - ensure it's a 1D numpy array
+            date_mask = (chunk_df['DATE'].values >= lookback_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
+            
+            # Filter using boolean indexing with numpy array (avoids MultiIndex issues)
+            filtered = chunk_df.iloc[date_mask].copy()
+            
             if len(filtered) > 0:
                 returns_chunks.append(filtered)
         all_returns = pd.concat(returns_chunks, ignore_index=True) if returns_chunks else pd.DataFrame()
+        # Remove duplicate columns after concatenation
+        if len(all_returns) > 0:
+            all_returns = all_returns.loc[:, ~all_returns.columns.duplicated()]
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loaded {len(all_returns):,} return rows in {time.time() - returns_start:.1f}s")
     except Exception as e:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error loading returns for {year}Q{quarter}: {e}")
@@ -146,14 +182,13 @@ def compute_exposures_for_quarter(
         return {'processed': 0, 'skipped': 0, 'quarter': f"{year}Q{quarter}", 'csv_path': None}
     
     # Now filter for just this quarter (smaller DataFrames)
-    quarter_prices = all_prices[
-        (all_prices['DATE'] >= quarter_start_dt) & 
-        (all_prices['DATE'] <= quarter_end_dt)
-    ].copy()
-    quarter_returns = all_returns[
-        (all_returns['DATE'] >= quarter_start_dt) & 
-        (all_returns['DATE'] <= quarter_end_dt)
-    ].copy()
+    # Data only contains trading days, so no holiday filtering needed
+    # Use .iloc with boolean numpy array to avoid MultiIndex issues
+    price_mask = (all_prices['DATE'].values >= quarter_start_dt) & (all_prices['DATE'].values <= quarter_end_dt)
+    quarter_prices = all_prices.iloc[price_mask].copy()
+    
+    return_mask = (all_returns['DATE'].values >= quarter_start_dt) & (all_returns['DATE'].values <= quarter_end_dt)
+    quarter_returns = all_returns.iloc[return_mask].copy()
     
     # Load fundamentals for this quarter only (chunked read to avoid memory issues)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loading fundamentals...")
@@ -168,14 +203,20 @@ def compute_exposures_for_quarter(
             if batch_count % 10 == 0:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Processed {batch_count} fundamental batches...")
             chunk_df = batch.to_pandas()
+            
+            # Reset index to avoid duplicate label issues
+            chunk_df = chunk_df.reset_index(drop=True)
+            
             chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
-            filtered = chunk_df[
-                (chunk_df['DATE'] >= quarter_start_dt) & 
-                (chunk_df['DATE'] <= quarter_end_dt)
-            ]
+            date_mask = (chunk_df['DATE'].values >= quarter_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
+            filtered = chunk_df.iloc[date_mask].copy()
+            
             if len(filtered) > 0:
                 quarter_fundamentals_chunks.append(filtered)
         quarter_fundamentals = pd.concat(quarter_fundamentals_chunks, ignore_index=True) if quarter_fundamentals_chunks else pd.DataFrame()
+        # Remove duplicate columns after concatenation
+        if len(quarter_fundamentals) > 0:
+            quarter_fundamentals = quarter_fundamentals.loc[:, ~quarter_fundamentals.columns.duplicated()]
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loaded {len(quarter_fundamentals):,} fundamental rows in {time.time() - fund_start:.1f}s")
     except Exception as e:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error loading fundamentals for {year}Q{quarter}: {e}")
@@ -185,6 +226,96 @@ def compute_exposures_for_quarter(
     
     if len(quarter_prices) == 0 or len(quarter_fundamentals) == 0:
         return {'processed': 0, 'skipped': 0, 'quarter': f"{year}Q{quarter}"}
+    
+    # Load market value data for this quarter (if available)
+    quarter_market_value = pd.DataFrame()
+    if market_value_path and market_value_path.exists():
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loading market value...")
+        mv_start = time.time()
+        try:
+            import pyarrow.parquet as pq
+            parquet_file = pq.ParquetFile(market_value_path)
+            mv_chunks = []
+            for batch in parquet_file.iter_batches(batch_size=500000):
+                chunk_df = batch.to_pandas()
+                
+                # Reset index to avoid duplicate label issues
+                chunk_df = chunk_df.reset_index(drop=True)
+                
+                chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
+                date_mask = (chunk_df['DATE'].values >= quarter_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
+                filtered = chunk_df.iloc[date_mask].copy()
+                
+                if len(filtered) > 0:
+                    mv_chunks.append(filtered)
+            quarter_market_value = pd.concat(mv_chunks, ignore_index=True) if mv_chunks else pd.DataFrame()
+            # Remove duplicate columns after concatenation
+            if len(quarter_market_value) > 0:
+                quarter_market_value = quarter_market_value.loc[:, ~quarter_market_value.columns.duplicated()]
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loaded {len(quarter_market_value):,} market value rows in {time.time() - mv_start:.1f}s")
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error loading market value for {year}Q{quarter}: {e}")
+            quarter_market_value = pd.DataFrame()
+    
+    # Load exchange rates for this quarter + lookback (if available)
+    all_exchange_rates = pd.DataFrame()
+    if exchange_rates_path and exchange_rates_path.exists():
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loading exchange rates...")
+        exr_start = time.time()
+        try:
+            import pyarrow.parquet as pq
+            parquet_file = pq.ParquetFile(exchange_rates_path)
+            exr_chunks = []
+            for batch in parquet_file.iter_batches(batch_size=500000):
+                chunk_df = batch.to_pandas()
+                
+                # Reset index to avoid duplicate label issues
+                chunk_df = chunk_df.reset_index(drop=True)
+                
+                chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
+                date_mask = (chunk_df['DATE'].values >= lookback_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
+                filtered = chunk_df.iloc[date_mask].copy()
+                
+                if len(filtered) > 0:
+                    exr_chunks.append(filtered)
+            all_exchange_rates = pd.concat(exr_chunks, ignore_index=True) if exr_chunks else pd.DataFrame()
+            # Remove duplicate columns after concatenation
+            if len(all_exchange_rates) > 0:
+                all_exchange_rates = all_exchange_rates.loc[:, ~all_exchange_rates.columns.duplicated()]
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loaded {len(all_exchange_rates):,} exchange rate rows in {time.time() - exr_start:.1f}s")
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error loading exchange rates for {year}Q{quarter}: {e}")
+            all_exchange_rates = pd.DataFrame()
+    
+    # Load enterprise value data for this quarter (if available)
+    quarter_enterprise_value = pd.DataFrame()
+    if enterprise_value_path and enterprise_value_path.exists():
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loading enterprise value...")
+        ev_start = time.time()
+        try:
+            import pyarrow.parquet as pq
+            parquet_file = pq.ParquetFile(enterprise_value_path)
+            ev_chunks = []
+            for batch in parquet_file.iter_batches(batch_size=500000):
+                chunk_df = batch.to_pandas()
+                
+                # Reset index to avoid duplicate label issues
+                chunk_df = chunk_df.reset_index(drop=True)
+                
+                chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
+                date_mask = (chunk_df['DATE'].values >= quarter_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
+                filtered = chunk_df.iloc[date_mask].copy()
+                
+                if len(filtered) > 0:
+                    ev_chunks.append(filtered)
+            quarter_enterprise_value = pd.concat(ev_chunks, ignore_index=True) if ev_chunks else pd.DataFrame()
+            # Remove duplicate columns after concatenation
+            if len(quarter_enterprise_value) > 0:
+                quarter_enterprise_value = quarter_enterprise_value.loc[:, ~quarter_enterprise_value.columns.duplicated()]
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loaded {len(quarter_enterprise_value):,} enterprise value rows in {time.time() - ev_start:.1f}s")
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error loading enterprise value for {year}Q{quarter}: {e}")
+            quarter_enterprise_value = pd.DataFrame()
     
     trading_dates = sorted(quarter_prices['DATE'].unique())
     
@@ -198,9 +329,37 @@ def compute_exposures_for_quarter(
         return {'processed': 0, 'skipped': 0, 'quarter': f"{year}Q{quarter}", 'csv_path': None}
     
     # OPTIMIZATION: Index DataFrames by DATE for O(1) lookups
+    # Remove duplicate columns first to avoid issues
+    quarter_prices = quarter_prices.loc[:, ~quarter_prices.columns.duplicated()]
+    quarter_returns = quarter_returns.loc[:, ~quarter_returns.columns.duplicated()]
+    quarter_fundamentals = quarter_fundamentals.loc[:, ~quarter_fundamentals.columns.duplicated()]
+    
+    # Ensure DATE columns are 1D (not DataFrame)
+    for df_name, df in [('prices', quarter_prices), ('returns', quarter_returns), ('fundamentals', quarter_fundamentals)]:
+        if 'DATE' in df.columns and isinstance(df['DATE'], pd.DataFrame):
+            df['DATE'] = df['DATE'].iloc[:, 0]
+    
+    if len(quarter_market_value) > 0:
+        quarter_market_value = quarter_market_value.loc[:, ~quarter_market_value.columns.duplicated()]
+        if 'DATE' in quarter_market_value.columns and isinstance(quarter_market_value['DATE'], pd.DataFrame):
+            quarter_market_value['DATE'] = quarter_market_value['DATE'].iloc[:, 0]
+    
+    if len(quarter_enterprise_value) > 0:
+        quarter_enterprise_value = quarter_enterprise_value.loc[:, ~quarter_enterprise_value.columns.duplicated()]
+        if 'DATE' in quarter_enterprise_value.columns and isinstance(quarter_enterprise_value['DATE'], pd.DataFrame):
+            quarter_enterprise_value['DATE'] = quarter_enterprise_value['DATE'].iloc[:, 0]
+    
+    if len(all_exchange_rates) > 0:
+        all_exchange_rates = all_exchange_rates.loc[:, ~all_exchange_rates.columns.duplicated()]
+        if 'DATE' in all_exchange_rates.columns and isinstance(all_exchange_rates['DATE'], pd.DataFrame):
+            all_exchange_rates['DATE'] = all_exchange_rates['DATE'].iloc[:, 0]
+    
     quarter_prices_idx = quarter_prices.set_index('DATE', drop=False)
     quarter_returns_idx = quarter_returns.set_index('DATE', drop=False)
     quarter_fundamentals_idx = quarter_fundamentals.set_index('DATE', drop=False)
+    quarter_market_value_idx = quarter_market_value.set_index('DATE', drop=False) if len(quarter_market_value) > 0 else None
+    quarter_enterprise_value_idx = quarter_enterprise_value.set_index('DATE', drop=False) if len(quarter_enterprise_value) > 0 else None
+    all_exchange_rates_idx = all_exchange_rates.set_index('DATE', drop=False) if len(all_exchange_rates) > 0 else None
     
     # Initialize calculator manager for this quarter
     calculator_manager = StockCalculatorManager()
@@ -269,9 +428,12 @@ def compute_exposures_for_quarter(
             returns_T = quarter_returns_idx.loc[[date_T]].copy() if date_T in quarter_returns_idx.index else pd.DataFrame()
         except (KeyError, TypeError):
             # Fallback if date not in index
-            fundamentals_T = quarter_fundamentals[quarter_fundamentals['DATE'] == date_T].copy()
-            prices_T = quarter_prices[quarter_prices['DATE'] == date_T].copy()
-            returns_T = quarter_returns[quarter_returns['DATE'] == date_T].copy()
+            fund_mask = (quarter_fundamentals['DATE'].values == date_T)
+            fundamentals_T = quarter_fundamentals.iloc[fund_mask].copy()
+            price_mask = (quarter_prices['DATE'].values == date_T)
+            prices_T = quarter_prices.iloc[price_mask].copy()
+            return_mask = (quarter_returns['DATE'].values == date_T)
+            returns_T = quarter_returns.iloc[return_mask].copy()
         
         if len(fundamentals_T) == 0 or len(prices_T) == 0 or len(returns_T) == 0:
             skipped += 1
@@ -306,21 +468,98 @@ def compute_exposures_for_quarter(
             how='inner'
         )
         
+        # Merge market value data if available
+        if quarter_market_value_idx is not None:
+            try:
+                market_value_T = quarter_market_value_idx.loc[[date_T]].copy() if date_T in quarter_market_value_idx.index else pd.DataFrame()
+                if len(market_value_T) > 0:
+                    df_T = df_T.merge(
+                        market_value_T[['FACTSET_ID', 'MARKETCAP', 'CURRENCY']],
+                        on='FACTSET_ID',
+                        how='left'
+                    )
+            except (KeyError, TypeError):
+                # Fallback if date not in index
+                market_value_T = quarter_market_value[quarter_market_value['DATE'] == date_T].copy()
+                if len(market_value_T) > 0:
+                    df_T = df_T.merge(
+                        market_value_T[['FACTSET_ID', 'MARKETCAP', 'CURRENCY']],
+                        on='FACTSET_ID',
+                        how='left'
+                    )
+        
+        # Merge enterprise value data if available
+        if quarter_enterprise_value_idx is not None:
+            try:
+                enterprise_value_T = quarter_enterprise_value_idx.loc[[date_T]].copy() if date_T in quarter_enterprise_value_idx.index else pd.DataFrame()
+                if len(enterprise_value_T) > 0:
+                    df_T = df_T.merge(
+                        enterprise_value_T[['FACTSET_ID', 'ENTERPRISE_VALUE']],
+                        on='FACTSET_ID',
+                        how='left'
+                    )
+            except (KeyError, TypeError):
+                # Fallback if date not in index
+                enterprise_value_T = quarter_enterprise_value[quarter_enterprise_value['DATE'] == date_T].copy()
+                if len(enterprise_value_T) > 0:
+                    df_T = df_T.merge(
+                        enterprise_value_T[['FACTSET_ID', 'ENTERPRISE_VALUE']],
+                        on='FACTSET_ID',
+                        how='left'
+                    )
+        
         if len(df_T) == 0:
             skipped += 1
             continue
         
-        # Calculate characteristics (same as before)
-        # Value
-        df_T['EY_NTM'] = df_T['EPS_NTM'] / df_T['ADJUSTED_PRICE']
-        df_T['SY_NTM'] = df_T['SALES_NTM'] / df_T['ADJUSTED_PRICE']
-        df_T['EBITDA_Y_NTM'] = df_T['EBITDA_NTM'] / df_T['ADJUSTED_PRICE']
-        df_T['EY_LTM'] = df_T['EPS_LTM'] / df_T['ADJUSTED_PRICE']
-        df_T['SY_LTM'] = df_T['SALES_LTM'] / df_T['ADJUSTED_PRICE']
+        # Calculate SIZE characteristic (log of market cap in USD)
+        if 'MARKETCAP' in df_T.columns and len(all_exchange_rates) > 0:
+            # Get exchange rates for this date
+            exchange_rates_T = pd.DataFrame()
+            if all_exchange_rates_idx is not None:
+                try:
+                    exchange_rates_T = all_exchange_rates_idx.loc[[date_T]].copy() if date_T in all_exchange_rates_idx.index else pd.DataFrame()
+                except (KeyError, TypeError):
+                    exchange_rates_T = all_exchange_rates[all_exchange_rates['DATE'] == date_T].copy()
+            else:
+                exchange_rates_T = all_exchange_rates[all_exchange_rates['DATE'] == date_T].copy() if len(all_exchange_rates) > 0 else pd.DataFrame()
+            
+            # Convert market cap from local currency to USD
+            if len(exchange_rates_T) > 0 and 'EXCHANGE_RATE_TO_USD' in exchange_rates_T.columns:
+                # Merge exchange rates by currency
+                df_T = df_T.merge(
+                    exchange_rates_T[['CURRENCY', 'EXCHANGE_RATE_TO_USD']],
+                    on='CURRENCY',
+                    how='left'
+                )
+                # For USD currency, set exchange rate to 1.0 explicitly
+                # For other currencies missing from exchange rates, fill with 1.0 (assume USD)
+                df_T.loc[df_T['CURRENCY'] == 'USD', 'EXCHANGE_RATE_TO_USD'] = 1.0
+                df_T['EXCHANGE_RATE_TO_USD'] = df_T['EXCHANGE_RATE_TO_USD'].fillna(1.0)
+                # Convert to USD: multiply by exchange rate
+                df_T['MARKETCAP_USD'] = df_T['MARKETCAP'] * df_T['EXCHANGE_RATE_TO_USD']
+            else:
+                # No exchange rates available - assume all are already in USD or set to NaN
+                df_T['MARKETCAP_USD'] = df_T['MARKETCAP']
+            
+            # Calculate log of market cap in USD
+            # Handle negative or zero values by setting to NaN
+            df_T.loc[df_T['MARKETCAP_USD'] <= 0, 'MARKETCAP_USD'] = np.nan
+            df_T['SIZE'] = np.log(df_T['MARKETCAP_USD'])
         
-        df_T.loc[df_T['EPS_NTM'] <= 0, 'EY_NTM'] = np.nan
-        df_T.loc[df_T['EBITDA_NTM'] <= 0, 'EBITDA_Y_NTM'] = np.nan
-        df_T.loc[df_T['EPS_LTM'] <= 0, 'EY_LTM'] = np.nan
+        # Calculate characteristics
+        # Value: Calculate EBITDA_LTM/EV and SALES_LTM/EV
+        if 'ENTERPRISE_VALUE' in df_T.columns:
+            df_T['EBITDA_LTM_EV'] = df_T['EBITDA_LTM'] / df_T['ENTERPRISE_VALUE']
+            df_T['SALES_LTM_EV'] = df_T['SALES_LTM'] / df_T['ENTERPRISE_VALUE']
+            
+            # Handle invalid values
+            df_T.loc[df_T['ENTERPRISE_VALUE'] <= 0, 'EBITDA_LTM_EV'] = np.nan
+            df_T.loc[df_T['ENTERPRISE_VALUE'] <= 0, 'SALES_LTM_EV'] = np.nan
+            df_T.loc[df_T['EBITDA_LTM'] <= 0, 'EBITDA_LTM_EV'] = np.nan
+        else:
+            df_T['EBITDA_LTM_EV'] = np.nan
+            df_T['SALES_LTM_EV'] = np.nan
         
         # Profitability
         df_T['EBITDA_MARGIN'] = df_T['EBITDA_LTM'] / df_T['SALES_LTM']
@@ -368,17 +607,27 @@ def compute_exposures_for_quarter(
         winsorize_lower = config.FACTOR_PARAMS['winsorize_lower']
         winsorize_upper = config.FACTOR_PARAMS['winsorize_upper']
         
-        value_chars = ['EY_NTM', 'SY_NTM', 'EBITDA_Y_NTM', 'EY_LTM', 'SY_LTM']
-        profitability_chars = ['EBITDA_MARGIN', 'GROSS_MARGIN']
-        growth_chars = ['EPS_GROWTH', 'SALES_GROWTH']
-        all_chars = value_chars + profitability_chars + growth_chars + ['MOMENTUM', 'VOLATILITY', 'LIQUIDITY']
+        # Characteristics that need general winsorization and z-scoring
+        # Value, Profitability, and Growth are handled separately below
+        all_chars = ['MOMENTUM', 'VOLATILITY', 'LIQUIDITY']
+        
+        # Add SIZE to characteristics if available
+        if 'SIZE' in df_T.columns:
+            all_chars.append('SIZE')
         
         # Filter to only characteristics that exist in df_T
         all_chars = [char for char in all_chars if char in df_T.columns]
         
         if len(all_chars) > 0:
             # Convert to NumPy array for faster operations
-            char_data = df_T[all_chars].values  # (N stocks × K chars)
+            # First ensure DataFrame columns are numeric (handles None values properly)
+            char_df = df_T[all_chars].copy()
+            for col in char_df.columns:
+                # Convert to numeric, coercing errors (None, strings, etc.) to NaN
+                char_df[col] = pd.to_numeric(char_df[col], errors='coerce')
+            
+            # Now convert to NumPy array - should be float64 with NaN for missing values
+            char_data = char_df.values.astype(np.float64)  # (N stocks × K chars)
             
             # Compute percentiles across axis=0 (across stocks for each characteristic)
             # This is much faster than pandas quantile in a loop
@@ -400,26 +649,122 @@ def compute_exposures_for_quarter(
             df_T[all_chars] = char_data_standardized
         
         # Combine into style factors
-        df_T['VALUE'] = df_T[value_chars].mean(axis=1, skipna=True)
-        if df_T['VALUE'].notna().sum() > 1:
-            val_mean = df_T['VALUE'].mean()
-            val_std = df_T['VALUE'].std()
-            if val_std > 0:
-                df_T['VALUE'] = (df_T['VALUE'] - val_mean) / val_std
+        # VALUE: Calculate EBITDA_LTM/EV and SALES_LTM/EV, z-score each, average, then z-score again
+        value_signals = ['EBITDA_LTM_EV', 'SALES_LTM_EV']
+        value_signals = [char for char in value_signals if char in df_T.columns]
         
-        df_T['PROFITABILITY'] = df_T[profitability_chars].mean(axis=1, skipna=True)
-        if df_T['PROFITABILITY'].notna().sum() > 1:
-            prof_mean = df_T['PROFITABILITY'].mean()
-            prof_std = df_T['PROFITABILITY'].std()
-            if prof_std > 0:
-                df_T['PROFITABILITY'] = (df_T['PROFITABILITY'] - prof_mean) / prof_std
+        if len(value_signals) > 0:
+            # Winsorize value signals
+            for char in value_signals:
+                # Ensure numeric type (handles None values)
+                df_T[char] = pd.to_numeric(df_T[char], errors='coerce')
+                if df_T[char].notna().sum() > 0:
+                    char_values = df_T[char].values.astype(np.float64)
+                    lower = np.nanpercentile(char_values, winsorize_lower * 100)
+                    upper = np.nanpercentile(char_values, winsorize_upper * 100)
+                    df_T[char] = np.clip(char_values, lower, upper)
+            
+            # Z-score each value signal separately
+            value_z_scores_df = pd.DataFrame(index=df_T.index)
+            for char in value_signals:
+                if df_T[char].notna().sum() > 1:
+                    mean_val = df_T[char].mean()
+                    std_val = df_T[char].std()
+                    if std_val > 0:
+                        value_z_scores_df[char] = (df_T[char] - mean_val) / std_val
+            
+            # Average the z-scores
+            if len(value_z_scores_df.columns) > 0:
+                df_T['VALUE'] = value_z_scores_df.mean(axis=1, skipna=True)
+                
+                # Z-score the average again
+                if df_T['VALUE'].notna().sum() > 1:
+                    val_mean = df_T['VALUE'].mean()
+                    val_std = df_T['VALUE'].std()
+                    if val_std > 0:
+                        df_T['VALUE'] = (df_T['VALUE'] - val_mean) / val_std
+            else:
+                df_T['VALUE'] = np.nan
+        else:
+            df_T['VALUE'] = np.nan
         
-        df_T['GROWTH'] = df_T[growth_chars].mean(axis=1, skipna=True)
-        if df_T['GROWTH'].notna().sum() > 1:
-            growth_mean = df_T['GROWTH'].mean()
-            growth_std = df_T['GROWTH'].std()
-            if growth_std > 0:
-                df_T['GROWTH'] = (df_T['GROWTH'] - growth_mean) / growth_std
+        # PROFITABILITY: Z-score each signal, average, then z-score again
+        profitability_signals = ['EBITDA_MARGIN', 'GROSS_MARGIN']
+        profitability_signals = [char for char in profitability_signals if char in df_T.columns]
+        
+        if len(profitability_signals) > 0:
+            # Winsorize profitability signals
+            for char in profitability_signals:
+                # Ensure numeric type (handles None values)
+                df_T[char] = pd.to_numeric(df_T[char], errors='coerce')
+                if df_T[char].notna().sum() > 0:
+                    char_values = df_T[char].values.astype(np.float64)
+                    lower = np.nanpercentile(char_values, winsorize_lower * 100)
+                    upper = np.nanpercentile(char_values, winsorize_upper * 100)
+                    df_T[char] = np.clip(char_values, lower, upper)
+            
+            # Z-score each profitability signal separately
+            profitability_z_scores_df = pd.DataFrame(index=df_T.index)
+            for char in profitability_signals:
+                if df_T[char].notna().sum() > 1:
+                    mean_val = df_T[char].mean()
+                    std_val = df_T[char].std()
+                    if std_val > 0:
+                        profitability_z_scores_df[char] = (df_T[char] - mean_val) / std_val
+            
+            # Average the z-scores
+            if len(profitability_z_scores_df.columns) > 0:
+                df_T['PROFITABILITY'] = profitability_z_scores_df.mean(axis=1, skipna=True)
+                
+                # Z-score the average again
+                if df_T['PROFITABILITY'].notna().sum() > 1:
+                    prof_mean = df_T['PROFITABILITY'].mean()
+                    prof_std = df_T['PROFITABILITY'].std()
+                    if prof_std > 0:
+                        df_T['PROFITABILITY'] = (df_T['PROFITABILITY'] - prof_mean) / prof_std
+            else:
+                df_T['PROFITABILITY'] = np.nan
+        else:
+            df_T['PROFITABILITY'] = np.nan
+        
+        # GROWTH: Z-score each signal, average, then z-score again
+        growth_signals = ['EPS_GROWTH', 'SALES_GROWTH']
+        growth_signals = [char for char in growth_signals if char in df_T.columns]
+        
+        if len(growth_signals) > 0:
+            # Winsorize growth signals
+            for char in growth_signals:
+                # Ensure numeric type (handles None values)
+                df_T[char] = pd.to_numeric(df_T[char], errors='coerce')
+                if df_T[char].notna().sum() > 0:
+                    char_values = df_T[char].values.astype(np.float64)
+                    lower = np.nanpercentile(char_values, winsorize_lower * 100)
+                    upper = np.nanpercentile(char_values, winsorize_upper * 100)
+                    df_T[char] = np.clip(char_values, lower, upper)
+            
+            # Z-score each growth signal separately
+            growth_z_scores_df = pd.DataFrame(index=df_T.index)
+            for char in growth_signals:
+                if df_T[char].notna().sum() > 1:
+                    mean_val = df_T[char].mean()
+                    std_val = df_T[char].std()
+                    if std_val > 0:
+                        growth_z_scores_df[char] = (df_T[char] - mean_val) / std_val
+            
+            # Average the z-scores
+            if len(growth_z_scores_df.columns) > 0:
+                df_T['GROWTH'] = growth_z_scores_df.mean(axis=1, skipna=True)
+                
+                # Z-score the average again
+                if df_T['GROWTH'].notna().sum() > 1:
+                    growth_mean = df_T['GROWTH'].mean()
+                    growth_std = df_T['GROWTH'].std()
+                    if growth_std > 0:
+                        df_T['GROWTH'] = (df_T['GROWTH'] - growth_mean) / growth_std
+            else:
+                df_T['GROWTH'] = np.nan
+        else:
+            df_T['GROWTH'] = np.nan
         
         # Create dummies
         sector_dummies = pd.get_dummies(df_T['SECTOR'], prefix='SECTOR')
@@ -559,11 +904,28 @@ def process_quarters_parallel(
     returns_path = data_path / 'returns.parquet'
     fundamentals_path = data_path / 'fundamentals.parquet'
     universe_path = data_path / 'universe.parquet'
+    market_value_path = data_path / 'market_value.parquet'
+    exchange_rates_path = data_path / 'exchange_rates.parquet'
+    enterprise_value_path = data_path / 'enterprise_value.parquet'
     
     if not prices_path.exists() or not returns_path.exists() or not fundamentals_path.exists():
         print(f"\n⚠ ERROR: Data files not found in {data_dir}/")
         print("   Please run 'python bulk_download.py' first to download data from Snowflake")
         return {'processed': 0, 'skipped': 0}
+    
+    # Warn if market value or exchange rates are missing (but continue processing)
+    if not market_value_path.exists():
+        print(f"\n⚠ WARNING: market_value.parquet not found in {data_dir}/")
+        print("   SIZE characteristic will not be calculated")
+        print("   Run 'python bulk_download.py' to download market value data")
+    if not exchange_rates_path.exists():
+        print(f"\n⚠ WARNING: exchange_rates.parquet not found in {data_dir}/")
+        print("   Market cap conversion to USD will not be performed")
+        print("   Run 'python bulk_download.py' to download exchange rate data")
+    if not enterprise_value_path.exists():
+        print(f"\n⚠ WARNING: enterprise_value.parquet not found in {data_dir}/")
+        print("   VALUE characteristic will not be calculated (requires EBITDA_LTM/EV and SALES_LTM/EV)")
+        print("   Run 'python bulk_download.py' to download enterprise value data")
     
     # Don't create DB connection here - each worker thread creates its own (SQLite is not thread-safe!)
     
@@ -610,7 +972,10 @@ def process_quarters_parallel(
         future_to_quarter = {
             executor.submit(
                 compute_exposures_for_quarter,
-                year, quarter, output_path, universe_df, prices_path, returns_path, fundamentals_path, start_date, end_date, neutralize
+                year, quarter, output_path, universe_df, prices_path, returns_path, fundamentals_path, 
+                start_date, end_date, neutralize, market_value_path if market_value_path.exists() else None,
+                exchange_rates_path if exchange_rates_path.exists() else None,
+                enterprise_value_path if enterprise_value_path.exists() else None
             ): (year, quarter)
             for year, quarter in quarters
         }

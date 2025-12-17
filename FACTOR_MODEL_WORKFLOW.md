@@ -24,37 +24,30 @@ Based on the specification, we need to generate the following tables:
 **Objective**: Calculate raw stock characteristics from fundamental and market data for each stock on each trading date.
 
 #### 1.1 Value Characteristics
-Calculate earnings and sales yields from fundamentals and prices:
+Calculate EBITDA and Sales yields from fundamentals and enterprise value:
 
 ```python
 # For each stock i on date t:
-EY_NTM[i,t] = EPS_NTM[i,t] / PRICE[i,t]
-SY_NTM[i,t] = SALES_NTM[i,t] / PRICE[i,t]
-EBITDA_Y_NTM[i,t] = EBITDA_NTM[i,t] / PRICE[i,t]
-EY_LTM[i,t] = EPS_LTM[i,t] / PRICE[i,t]
-SY_LTM[i,t] = SALES_LTM[i,t] / PRICE[i,t]
+EBITDA_LTM_EV[i,t] = EBITDA_LTM[i,t] / ENTERPRISE_VALUE[i,t]
+SALES_LTM_EV[i,t] = SALES_LTM[i,t] / ENTERPRISE_VALUE[i,t]
 
 # Handle invalid values:
-IF EPS_NTM[i,t] <= 0 THEN EY_NTM[i,t] = NaN
-IF EBITDA_NTM[i,t] <= 0 THEN EBITDA_Y_NTM[i,t] = NaN
-IF EPS_LTM[i,t] <= 0 THEN EY_LTM[i,t] = NaN
+IF ENTERPRISE_VALUE[i,t] <= 0 THEN EBITDA_LTM_EV[i,t] = NaN, SALES_LTM_EV[i,t] = NaN
+IF EBITDA_LTM[i,t] <= 0 THEN EBITDA_LTM_EV[i,t] = NaN
 ```
 
 **Pseudocode**:
 ```
 FOR each trading date t:
     FOR each stock i in universe:
-        Load fundamentals[i,t]: EPS_NTM, SALES_NTM, EBITDA_NTM, EPS_LTM, SALES_LTM
-        Load price[i,t]
+        Load fundamentals[i,t]: EBITDA_LTM, SALES_LTM
+        Load enterprise_value[i,t]
         
         Calculate value characteristics:
-            EY_NTM[i,t] = EPS_NTM[i,t] / price[i,t]
-            SY_NTM[i,t] = SALES_NTM[i,t] / price[i,t]
-            EBITDA_Y_NTM[i,t] = EBITDA_NTM[i,t] / price[i,t]
-            EY_LTM[i,t] = EPS_LTM[i,t] / price[i,t]
-            SY_LTM[i,t] = SALES_LTM[i,t] / price[i,t]
+            EBITDA_LTM_EV[i,t] = EBITDA_LTM[i,t] / enterprise_value[i,t]
+            SALES_LTM_EV[i,t] = SALES_LTM[i,t] / enterprise_value[i,t]
         
-        Apply validity checks (set to NaN if denominator <= 0)
+        Apply validity checks (set to NaN if denominator <= 0 or numerator <= 0)
 ```
 
 #### 1.2 Profitability Characteristics
@@ -81,7 +74,42 @@ IF EPS_LTM[i,t] <= 0 THEN EPS_GROWTH[i,t] = NaN
 IF SALES_LTM[i,t] <= 0 THEN SALES_GROWTH[i,t] = NaN
 ```
 
-#### 1.4 Market-Based Characteristics
+#### 1.4 Size Characteristic
+Calculate size as the natural logarithm of market capitalization in USD:
+
+```python
+# For each stock i on date t:
+# Step 1: Convert market cap from local currency to USD
+MARKETCAP_USD[i,t] = MARKETCAP[i,t] * EXCHANGE_RATE_TO_USD[i,t]
+
+# Step 2: Calculate log of market cap
+SIZE[i,t] = LOG(MARKETCAP_USD[i,t])
+
+# Handle invalid values:
+IF MARKETCAP_USD[i,t] <= 0 THEN SIZE[i,t] = NaN
+```
+
+**Pseudocode**:
+```
+FOR each trading date t:
+    FOR each stock i in universe:
+        Load market_value[i,t]: MARKETCAP, CURRENCY
+        Load exchange_rate[i,t]: EXCHANGE_RATE_TO_USD
+        
+        # Convert to USD
+        IF CURRENCY[i,t] == 'USD':
+            MARKETCAP_USD[i,t] = MARKETCAP[i,t]
+        ELSE:
+            MARKETCAP_USD[i,t] = MARKETCAP[i,t] * EXCHANGE_RATE_TO_USD[i,t]
+        
+        # Calculate log of market cap
+        IF MARKETCAP_USD[i,t] > 0:
+            SIZE[i,t] = log(MARKETCAP_USD[i,t])
+        ELSE:
+            SIZE[i,t] = NaN
+```
+
+#### 1.5 Market-Based Characteristics
 Calculate momentum, volatility, and liquidity using rolling windows:
 
 ```python
@@ -126,105 +154,157 @@ FOR each trading date t:
 
 ### STEP 2: Combine Characteristics into Style Factors
 
-**Objective**: Aggregate related characteristics into composite style factors using equal-weighted averaging.
+**Objective**: Aggregate related characteristics into composite style factors. For factors with multiple signals, the process is: winsorize each signal, z-score each signal separately, average the z-scores, then z-score the average again.
 
 #### 2.1 Factor Combination Logic
 
+**General Pattern for Multi-Signal Factors**:
+When combining multiple signals into one factor, always:
+1. Winsorize each signal (1st and 99th percentiles)
+2. Z-score each signal separately (cross-sectionally on each date)
+3. Take equal-weighted average of the z-scores (for 2 signals, each gets weight 1/2)
+4. Z-score the average again
+
+**Mathematical Formulation** (for factors with 2 signals):
+
+For a factor with signals A and B:
+
+```
+FACTOR_{i,t} = z( (1/2) * z(A_{i,t}) + (1/2) * z(B_{i,t}) )
+```
+
+Where:
+- `z(A_{i,t})` = cross-sectional z-score of signal A on date t
+- `z(B_{i,t})` = cross-sectional z-score of signal B on date t
+- `(1/2) * z(A_{i,t}) + (1/2) * z(B_{i,t})` = equal-weighted average of z-scores
+- `z(...)` = final cross-sectional z-score of the average
+
+**Example: VALUE Factor**
+
+```
+VALUE_{i,t} = z( (1/2) * z(EBITDA_LTM_EV_{i,t}) + (1/2) * z(SALES_LTM_EV_{i,t}) )
+```
+
+**Implementation Steps**:
+
 ```python
-# Value factor: average of all value characteristics
-VALUE[i,t] = MEAN(EY_NTM[i,t], SY_NTM[i,t], EBITDA_Y_NTM[i,t], EY_LTM[i,t], SY_LTM[i,t])
+# VALUE factor: EBITDA_LTM/EV and SALES_LTM/EV
+# Step 1: Winsorize each signal
+EBITDA_LTM_EV_winsorized = winsorize(EBITDA_LTM_EV, 0.01, 0.99)
+SALES_LTM_EV_winsorized = winsorize(SALES_LTM_EV, 0.01, 0.99)
 
-# Profitability factor: average of profitability characteristics
-PROFITABILITY[i,t] = MEAN(EBITDA_MARGIN[i,t], GROSS_MARGIN[i,t])
+# Step 2: Z-score each signal separately
+z_EBITDA = zscore(EBITDA_LTM_EV_winsorized)  # Cross-sectional z-score
+z_SALES = zscore(SALES_LTM_EV_winsorized)     # Cross-sectional z-score
 
-# Growth factor: average of growth characteristics
-GROWTH[i,t] = MEAN(EPS_GROWTH[i,t], SALES_GROWTH[i,t])
+# Step 3: Equal-weighted average of z-scores (each signal gets 1/2 weight)
+VALUE_raw = (1/2) * z_EBITDA + (1/2) * z_SALES
 
-# Momentum, Volatility, Liquidity are already single characteristics
-# They become factors directly: MOMENTUM, VOLATILITY, LIQUIDITY
+# Step 4: Z-score the average again
+VALUE[i,t] = zscore(VALUE_raw)  # Cross-sectional z-score
+
+# PROFITABILITY factor: EBITDA_MARGIN and GROSS_MARGIN
+# Same process as VALUE
+z_EBITDA_MARGIN = zscore(winsorize(EBITDA_MARGIN, 0.01, 0.99))
+z_GROSS_MARGIN = zscore(winsorize(GROSS_MARGIN, 0.01, 0.99))
+PROFITABILITY_raw = (1/2) * z_EBITDA_MARGIN + (1/2) * z_GROSS_MARGIN
+PROFITABILITY[i,t] = zscore(PROFITABILITY_raw)
+
+# GROWTH factor: EPS_GROWTH and SALES_GROWTH
+# Same process as VALUE
+z_EPS_GROWTH = zscore(winsorize(EPS_GROWTH, 0.01, 0.99))
+z_SALES_GROWTH = zscore(winsorize(SALES_GROWTH, 0.01, 0.99))
+GROWTH_raw = (1/2) * z_EPS_GROWTH + (1/2) * z_SALES_GROWTH
+GROWTH[i,t] = zscore(GROWTH_raw)
+
+# Momentum, Volatility, Liquidity are single characteristics
+# They are winsorized and z-scored once (no combination needed)
+MOMENTUM[i,t] = zscore(winsorize(MOMENTUM[i,t], 0.01, 0.99))
+VOLATILITY[i,t] = zscore(winsorize(VOLATILITY[i,t], 0.01, 0.99))
+LIQUIDITY[i,t] = zscore(winsorize(LIQUIDITY[i,t], 0.01, 0.99))
 ```
 
 **Pseudocode**:
 ```
 FOR each trading date t:
+    # VALUE factor
+    # Step 1: Winsorize each signal
+    EBITDA_LTM_EV_winsorized = winsorize(EBITDA_LTM_EV[t], 0.01, 0.99)
+    SALES_LTM_EV_winsorized = winsorize(SALES_LTM_EV[t], 0.01, 0.99)
+    
+    # Step 2: Z-score each signal separately (cross-sectionally)
+    z_EBITDA = zscore(EBITDA_LTM_EV_winsorized)  # Mean=0, Std=1 across stocks
+    z_SALES = zscore(SALES_LTM_EV_winsorized)     # Mean=0, Std=1 across stocks
+    
+    # Step 3: Equal-weighted average (each signal gets 1/2 weight)
     FOR each stock i:
-        # Value factor
-        value_chars = [EY_NTM[i,t], SY_NTM[i,t], EBITDA_Y_NTM[i,t], EY_LTM[i,t], SY_LTM[i,t]]
-        VALUE[i,t] = mean(value_chars, skipna=True)  # Skip NaN values
-        
-        # Profitability factor
-        profitability_chars = [EBITDA_MARGIN[i,t], GROSS_MARGIN[i,t]]
-        PROFITABILITY[i,t] = mean(profitability_chars, skipna=True)
-        
-        # Growth factor
-        growth_chars = [EPS_GROWTH[i,t], SALES_GROWTH[i,t]]
-        GROWTH[i,t] = mean(growth_chars, skipna=True)
-        
-        # Individual factors (no combination needed)
-        MOMENTUM[i,t] = MOMENTUM[i,t]  # Already calculated
-        VOLATILITY[i,t] = VOLATILITY[i,t]  # Already calculated
-        LIQUIDITY[i,t] = LIQUIDITY[i,t]  # Already calculated
+        VALUE_raw[i,t] = (1/2) * z_EBITDA[i,t] + (1/2) * z_SALES[i,t]
+    
+    # Step 4: Z-score the average again (cross-sectionally)
+    VALUE[i,t] = zscore(VALUE_raw[t])
+    
+    # PROFITABILITY factor (same process)
+    EBITDA_MARGIN_winsorized = winsorize(EBITDA_MARGIN[t], 0.01, 0.99)
+    GROSS_MARGIN_winsorized = winsorize(GROSS_MARGIN[t], 0.01, 0.99)
+    z_EBITDA_MARGIN = zscore(EBITDA_MARGIN_winsorized)
+    z_GROSS_MARGIN = zscore(GROSS_MARGIN_winsorized)
+    FOR each stock i:
+        PROFITABILITY_raw[i,t] = (1/2) * z_EBITDA_MARGIN[i,t] + (1/2) * z_GROSS_MARGIN[i,t]
+    PROFITABILITY[i,t] = zscore(PROFITABILITY_raw[t])
+    
+    # GROWTH factor (same process)
+    EPS_GROWTH_winsorized = winsorize(EPS_GROWTH[t], 0.01, 0.99)
+    SALES_GROWTH_winsorized = winsorize(SALES_GROWTH[t], 0.01, 0.99)
+    z_EPS_GROWTH = zscore(EPS_GROWTH_winsorized)
+    z_SALES_GROWTH = zscore(SALES_GROWTH_winsorized)
+    FOR each stock i:
+        GROWTH_raw[i,t] = (1/2) * z_EPS_GROWTH[i,t] + (1/2) * z_SALES_GROWTH[i,t]
+    GROWTH[i,t] = zscore(GROWTH_raw[t])
+    
+    # Individual factors (winsorize and z-score once)
+    MOMENTUM[i,t] = zscore(winsorize(MOMENTUM[t], 0.01, 0.99))
+    VOLATILITY[i,t] = zscore(winsorize(VOLATILITY[t], 0.01, 0.99))
+    LIQUIDITY[i,t] = zscore(winsorize(LIQUIDITY[t], 0.01, 0.99))
 ```
 
-**Note**: The combination logic uses equal-weighted averaging. This can be modified in the future to use other weighting schemes (e.g., factor loadings, economic significance).
+**Note**: This two-stage z-scoring approach ensures that:
+- Each signal is standardized before averaging (prevents scale differences from affecting the average)
+- The final factor is standardized again (ensures proper cross-sectional distribution)
 
 ---
 
 ### STEP 3: Calculate Z-Scores (Cross-Sectional Standardization)
 
-**Objective**: Standardize all characteristics and factors to z-scores on each date across all stocks. This creates the exposure table.
+**Objective**: Standardize characteristics and factors to z-scores on each date across all stocks. This creates the exposure table.
 
-#### 3.1 Winsorization (Outlier Treatment)
+**Important**: The z-scoring process differs depending on whether a factor has multiple signals or is a single characteristic:
 
-Before standardization, winsorize extreme values to prevent outliers from dominating:
+- **Multi-signal factors (VALUE, PROFITABILITY, GROWTH)**: Z-scoring is done during factor combination (Step 2), not here
+- **Single characteristics (MOMENTUM, VOLATILITY, LIQUIDITY, SIZE)**: Z-scoring is done here
+
+#### 3.1 Winsorization and Z-Scoring for Single Characteristics
+
+For single characteristics (MOMENTUM, VOLATILITY, LIQUIDITY, SIZE), winsorize and z-score:
 
 ```python
-# For each characteristic/factor on each date t:
-FOR each char in [all characteristics + style factors]:
+# For each single characteristic on each date t:
+FOR each char in [MOMENTUM, VOLATILITY, LIQUIDITY, SIZE]:
+    # Step 1: Winsorize
     values = [char[i,t] for all stocks i on date t]
     lower_bound = quantile(values, 0.01)  # 1st percentile
     upper_bound = quantile(values, 0.99)  # 99th percentile
     
     FOR each stock i:
         char[i,t] = clip(char[i,t], lower_bound, upper_bound)
-```
-
-**Pseudocode**:
-```
-FOR each trading date t:
-    FOR each characteristic char in [EY_NTM, SY_NTM, ..., VALUE, PROFITABILITY, GROWTH, MOMENTUM, VOLATILITY, LIQUIDITY]:
-        # Get all values for this date
-        values = [char[i,t] for all stocks i where char[i,t] is not NaN]
-        
-        IF len(values) > 0:
-            # Calculate winsorization bounds
-            lower_bound = quantile(values, 0.01)  # 1% lower tail
-            upper_bound = quantile(values, 0.99)  # 99% upper tail
-            
-            # Clip extreme values
-            FOR each stock i:
-                IF char[i,t] < lower_bound:
-                    char[i,t] = lower_bound
-                ELSE IF char[i,t] > upper_bound:
-                    char[i,t] = upper_bound
-```
-
-#### 3.2 Cross-Sectional Z-Score Standardization
-
-Standardize each characteristic/factor to have mean=0 and std=1 across all stocks on each date:
-
-```python
-# For each characteristic/factor on each date t:
-FOR each char in [all characteristics + style factors]:
-    values = [char[i,t] for all stocks i on date t]
-    mean_t = mean(values)
-    std_t = std(values)
+    
+    # Step 2: Z-score
+    mean_t = mean(char[i,t] for all stocks i)
+    std_t = std(char[i,t] for all stocks i)
     
     IF std_t > 0:
         FOR each stock i:
             char[i,t] = (char[i,t] - mean_t) / std_t
     ELSE:
-        # All values are the same, set to 0
         FOR each stock i:
             char[i,t] = 0.0
 ```
@@ -232,30 +312,35 @@ FOR each char in [all characteristics + style factors]:
 **Pseudocode**:
 ```
 FOR each trading date t:
-    FOR each characteristic char in [all characteristics + style factors]:
-        # Get all non-NaN values for this date
+    FOR each single characteristic char in [MOMENTUM, VOLATILITY, LIQUIDITY, SIZE]:
+        # Get all values for this date
         values = [char[i,t] for all stocks i where char[i,t] is not NaN]
         
-        IF len(values) > 1:
-            mean_t = mean(values)
-            std_t = std(values)
+        IF len(values) > 0:
+            # Winsorize
+            lower_bound = quantile(values, 0.01)
+            upper_bound = quantile(values, 0.99)
+            FOR each stock i:
+                char[i,t] = clip(char[i,t], lower_bound, upper_bound)
             
-            IF std_t > 0:
-                # Standardize to z-scores
-                FOR each stock i:
-                    IF char[i,t] is not NaN:
-                        char[i,t] = (char[i,t] - mean_t) / std_t
-            ELSE:
-                # All values identical, set to 0
-                FOR each stock i:
-                    IF char[i,t] is not NaN:
-                        char[i,t] = 0.0
-        ELSE:
-            # Not enough data, leave as NaN
-            pass
+            # Z-score
+            IF len(values) > 1:
+                mean_t = mean(values)
+                std_t = std(values)
+                IF std_t > 0:
+                    FOR each stock i:
+                        IF char[i,t] is not NaN:
+                            char[i,t] = (char[i,t] - mean_t) / std_t
+                ELSE:
+                    FOR each stock i:
+                        IF char[i,t] is not NaN:
+                            char[i,t] = 0.0
 ```
 
-**Note**: After this step, we have z-scores for all style factors (VALUE, PROFITABILITY, GROWTH, MOMENTUM, VOLATILITY, LIQUIDITY). These z-scores represent the **exposures** to each style factor.
+**Note**: 
+- VALUE, PROFITABILITY, and GROWTH factors are already z-scored during Step 2 (factor combination)
+- MOMENTUM, VOLATILITY, LIQUIDITY, and SIZE are z-scored here
+- After this step, all style factors (VALUE, PROFITABILITY, GROWTH, MOMENTUM, VOLATILITY, LIQUIDITY) are z-scores representing the **exposures** to each style factor
 
 ---
 

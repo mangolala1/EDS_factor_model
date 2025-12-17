@@ -136,11 +136,28 @@ def test_single_day(
         returns_path = Path(data_dir) / 'returns.parquet'
         if returns_path.exists():
             returns_df = pd.read_parquet(returns_path)
+            
+            # Remove duplicate columns first
+            returns_df = returns_df.loc[:, ~returns_df.columns.duplicated()]
+            
             if 'FSYM_ID' in returns_df.columns:
                 returns_df = returns_df.rename(columns={'FSYM_ID': 'FACTSET_ID'})
+            
+            # Handle DATE column - prefer P_DATE if both exist
             if 'P_DATE' in returns_df.columns:
+                # If DATE also exists, drop it first to avoid duplicates
+                if 'DATE' in returns_df.columns:
+                    returns_df = returns_df.drop(columns=['DATE'])
                 returns_df = returns_df.rename(columns={'P_DATE': 'DATE'})
-            returns_df['DATE'] = pd.to_datetime(returns_df['DATE'])
+            elif 'DATE' not in returns_df.columns:
+                # No DATE column at all - skip
+                returns_df = pd.DataFrame()
+            
+            # Ensure DATE is a single column (not DataFrame) before converting
+            if len(returns_df) > 0 and 'DATE' in returns_df.columns:
+                if isinstance(returns_df['DATE'], pd.DataFrame):
+                    returns_df['DATE'] = returns_df['DATE'].iloc[:, 0]
+                returns_df['DATE'] = pd.to_datetime(returns_df['DATE'])
             
             # For specific risk calculation, we need ALL historical data up to test_date
             # Don't filter to just the processed dates - use all available data
@@ -153,8 +170,11 @@ def test_single_day(
             returns_df = pd.DataFrame()
         
         print(f"   ✓ Loaded {len(returns_df):,} return observations")
-        print(f"   ✓ Date range: {returns_df['DATE'].min()} to {returns_df['DATE'].max()}")
-        print(f"   ✓ Unique dates: {returns_df['DATE'].nunique()}")
+        if len(returns_df) > 0 and 'DATE' in returns_df.columns:
+            print(f"   ✓ Date range: {returns_df['DATE'].min()} to {returns_df['DATE'].max()}")
+            print(f"   ✓ Unique dates: {returns_df['DATE'].nunique()}")
+        else:
+            print("   ⚠ No returns data loaded")
         
         # Calculate factor returns
         # We need factor returns for ALL dates where we have both exposures and returns
@@ -436,6 +456,11 @@ def test_single_day(
             exposures_wide_for_names = exposures_for_names
         
         # Generate factor names table
+        # Initialize model_builder if not already initialized
+        if model_builder is None:
+            from src.model_builder import FactorModelBuilder
+            model_builder = FactorModelBuilder()
+        
         with tqdm(total=1, desc="Factor names", bar_format='{desc}: {elapsed}') as pbar:
             factor_names_df = model_builder.create_factor_names_table(exposures_wide_for_names)
             pbar.update(1)
