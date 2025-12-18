@@ -783,9 +783,9 @@ def compute_exposures_for_quarter(
             continent_dummies = continent_dummies - continent_dummies.mean(axis=0)
         
         # Combine exposures
-        # Ensure MOMENTUM, VOLATILITY, LIQUIDITY are included even if some values are NaN
+        # Ensure MOMENTUM, VOLATILITY, LIQUIDITY, SIZE are included even if some values are NaN
         style_factor_cols = ['FACTSET_ID', 'VALUE', 'PROFITABILITY', 'GROWTH']
-        for factor in ['MOMENTUM', 'VOLATILITY', 'LIQUIDITY']:
+        for factor in ['MOMENTUM', 'VOLATILITY', 'LIQUIDITY', 'SIZE']:
             if factor in df_T.columns:
                 style_factor_cols.append(factor)
         

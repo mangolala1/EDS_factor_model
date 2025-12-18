@@ -4,6 +4,26 @@
 
 This document describes the complete workflow for constructing the EDS factor model and generating the required output tables as specified in the data dictionary. The workflow transforms raw stock characteristics into standardized factor exposures, then uses these exposures to estimate factor returns and calculate risk metrics.
 
+**Workflow Execution Order:**
+
+The workflow is executed in **two phases**:
+
+1. **Phase 1: Daily Calculations (Steps 1-7)**
+   - Calculate exposures, factor returns, and specific returns for all dates from 2020-01-01 onwards
+   - These steps process each date sequentially
+
+2. **Phase 2: End-of-Pipeline Calculations (Steps 8-9)**
+   - Calculate factor covariance matrix and specific risk **after** all daily calculations are complete
+   - These steps use the complete history of factor returns and returns for rolling window calculations
+
+**Output Format:**
+
+All output tables are saved in **Parquet format** (not CSV) for:
+- **Faster I/O**: 5-10x faster read/write operations compared to CSV
+- **Better Compression**: Typically 50-80% smaller file sizes
+- **Type Preservation**: Maintains data types (no need to re-parse strings as numbers)
+- **Columnar Storage**: Efficient for analytical queries and filtering
+
 ## Required Output Tables
 
 Based on the specification, we need to generate the following tables:
@@ -149,6 +169,146 @@ FOR each trading date t:
 ```
 
 **Current Implementation**: Uses `StockCalculatorManager` class with ring buffers to efficiently maintain rolling windows for each stock.
+
+#### 1.5.1 Ring Buffer Architecture
+
+The ring buffer implementation provides a **memory-efficient and computationally fast** way to maintain rolling windows for thousands of stocks simultaneously. This is critical for processing large universes (30,000+ stocks) over multiple years of data.
+
+**What is a Ring Buffer?**
+
+A ring buffer (also called a circular buffer) is a fixed-size data structure that automatically overwrites the oldest data when full. It uses Python's `collections.deque` with a `maxlen` parameter, which provides O(1) insertion and deletion operations.
+
+**Key Benefits:**
+
+1. **Fixed Memory Footprint**: Each stock's buffer uses a constant amount of memory (e.g., 252 floats for momentum), regardless of how many historical dates we've processed
+2. **Automatic Window Management**: When the buffer is full, adding a new value automatically removes the oldest value - no manual cleanup needed
+3. **Fast Access**: O(1) operations for adding new data and accessing the buffer contents
+4. **Scalability**: Can maintain buffers for 30,000+ stocks without memory issues
+
+**Architecture Overview:**
+
+```
+StockCalculatorManager (one per quarter)
+    ├── calculators: Dict[str, StockCalculators]
+    │   ├── StockCalculators for stock "ABC123"
+    │   │   ├── MomentumCalculator
+    │   │   │   └── RollingReturnBuffer (maxlen=273)
+    │   │   │       ├── returns: deque([r1, r2, ..., r273])
+    │   │   │       └── dates: deque([d1, d2, ..., d273])
+    │   │   ├── VolatilityCalculator
+    │   │   │   └── RollingReturnBuffer (maxlen=60)
+    │   │   │       └── returns: deque([r1, r2, ..., r60])
+    │   │   └── LiquidityCalculator
+    │   │       └── dollar_volumes: deque([v1, v2, ..., v20])
+    │   ├── StockCalculators for stock "DEF456"
+    │   │   └── ... (same structure)
+    │   └── ... (one per stock in universe)
+```
+
+**Implementation Details:**
+
+1. **RollingReturnBuffer**:
+   - Uses `deque(maxlen=window_size)` to store returns and dates
+   - Automatically maintains the most recent `window_size` values
+   - Provides `get_returns_array()` to convert to NumPy array for calculations
+
+2. **MomentumCalculator**:
+   - Buffer size: 273 days (252 lookback + 21 exclude + 10 buffer)
+   - Calculation: `(1+ret_12m).prod() - (1+ret_1m).prod()`
+   - Uses all returns except the last 21 days for 12-month return
+   - Uses last 21 days for 1-month return
+
+3. **VolatilityCalculator**:
+   - Buffer size: 60 days
+   - Calculates standard deviation of returns in the buffer
+   - Uses NumPy's `np.var()` for efficient calculation
+
+4. **LiquidityCalculator**:
+   - Buffer size: 20 days
+   - Stores dollar volumes (price × volume)
+   - Calculates: `log(mean(dollar_volumes))`
+
+**Workflow in Quarter Processing:**
+
+```
+FOR each quarter:
+    1. Initialize StockCalculatorManager (empty)
+    
+    2. Populate Historical Buffers (BEFORE processing quarter dates):
+       FOR each historical date (last ~300 days before quarter start):
+           FOR each stock with return/price data:
+               calculator_manager.update_stock(
+                   factset_id,
+                   date,
+                   return_value,
+                   dollar_volume
+               )
+       → This builds up the rolling windows so calculations are ready
+    
+    3. Process Quarter Dates:
+       FOR each trading date t in quarter:
+           a. Update buffers with new data:
+              FOR each stock:
+                  calculator_manager.update_stock(...)
+              
+           b. Calculate characteristics:
+              momentum = calculator_manager.get_momentum(factset_id)
+              volatility = calculator_manager.get_volatility(factset_id)
+              liquidity = calculator_manager.get_liquidity(factset_id)
+```
+
+**Memory Efficiency Example:**
+
+For a universe of 30,000 stocks:
+- **Without ring buffers**: Would need to store all historical returns for all stocks (potentially millions of values per stock)
+- **With ring buffers**: 
+  - Momentum: 30,000 × 273 × 8 bytes = ~65 MB
+  - Volatility: 30,000 × 60 × 8 bytes = ~14 MB
+  - Liquidity: 30,000 × 20 × 8 bytes = ~5 MB
+  - **Total: ~84 MB** (vs. potentially GBs without buffers)
+
+**Performance Characteristics:**
+
+- **Buffer Update**: O(1) per stock per date
+- **Characteristic Calculation**: O(W) where W is window size (e.g., 60 for volatility)
+- **Overall**: O(N × D × W) where N = stocks, D = dates, W = window size
+- **Optimization**: Pre-populating historical buffers means calculations are ready immediately for quarter dates
+
+**Key Implementation Features:**
+
+1. **Lazy Initialization**: Calculators are created on-demand when first accessed
+2. **Automatic Cleanup**: Old data is automatically removed when buffers are full
+3. **Date Tracking**: Buffers store both values and dates for debugging/validation
+4. **Error Handling**: Returns `None` if insufficient data (e.g., < 60 days for volatility)
+5. **Vectorized Calculations**: Once data is in NumPy arrays, uses vectorized operations
+
+**Example Usage:**
+
+```python
+# Initialize manager
+calculator_manager = StockCalculatorManager()
+
+# Populate historical buffers (before processing quarter)
+for hist_date in historical_dates:
+    for stock in stocks:
+        calculator_manager.update_stock(
+            stock.factset_id,
+            hist_date,
+            stock.return_value,
+            stock.dollar_volume
+        )
+
+# Process quarter dates
+for date in quarter_dates:
+    # Update buffers with new data
+    for stock in stocks:
+        calculator_manager.update_stock(...)
+    
+    # Calculate characteristics (buffers are ready)
+    momentum = calculator_manager.get_momentum(stock.factset_id)
+    volatility = calculator_manager.get_volatility(stock.factset_id)
+    liquidity = calculator_manager.get_liquidity(stock.factset_id)
+```
 
 ---
 
@@ -618,6 +778,8 @@ EDS   | 2020-01-02 | SECTOR_Technology              | 0.0004
 ...
 ```
 
+**Note**: Factor returns are calculated for all dates starting from 2020-01-01. The results are saved to Parquet format for efficient storage and fast loading in subsequent steps (Steps 8-9).
+
 ---
 
 ### STEP 7: Calculate Specific Returns
@@ -684,11 +846,13 @@ EDS   | 2020-01-02 | GHI789      | 0.0008
 ...
 ```
 
+**Note**: Specific returns are calculated for all dates starting from 2020-01-01. The results are saved to Parquet format for efficient storage.
+
 ---
 
 ### STEP 8: Calculate Factor Covariance Matrix
 
-**Objective**: Calculate the covariance matrix of factor returns using a rolling window.
+**Objective**: Calculate the covariance matrix of factor returns using a rolling window. **This step is performed AFTER all daily factor returns have been calculated (starting from 2020-01-01), not within the daily loop.**
 
 #### 8.1 Rolling Window Covariance
 
@@ -703,8 +867,16 @@ EDS   | 2020-01-02 | GHI789      | 0.0008
 # Where Σ_f(T) is a K×K matrix (K = number of factors)
 ```
 
+**Important**: This calculation is performed **after Step 6 and Step 7 are complete** (i.e., after all factor returns and specific returns have been calculated for all dates from 2020-01-01 onwards). This allows us to use the complete history of factor returns for the rolling window calculations.
+
 **Pseudocode**:
 ```
+# STEP 8: Calculate Factor Covariance Matrix
+# (Performed AFTER all factor returns are calculated in Step 6)
+
+# Load all factor returns calculated in Step 6 (from 2020-01-01 onwards)
+factor_returns_df = load_factor_returns()  # All dates from 2020-01-01
+
 # Pivot factor returns to wide format (one column per factor)
 factor_returns_wide = pivot_table(
     factor_returns_df,
@@ -716,13 +888,17 @@ factor_returns_wide = pivot_table(
 # Sort by date
 factor_returns_wide = factor_returns_wide.sort_index()
 
-FOR each as_of_date T in sorted_dates:
+# Get all dates for which we have factor returns
+all_dates = factor_returns_wide.index
+
+FOR each as_of_date T in all_dates:
     # OPTIMIZATION: Use efficient window indexing instead of filtering all dates
+    date_idx = all_dates.get_loc(T)
     window_start_idx = max(0, date_idx - window + 1)
     window_data = factor_returns_wide.iloc[window_start_idx:date_idx + 1]
     
     IF len(window_data) < (window / 2):
-        SKIP date T  # Not enough history
+        SKIP date T  # Not enough history (need at least 30 days)
     
     # Calculate covariance matrix
     cov_matrix = window_data.cov()  # K×K matrix
@@ -736,6 +912,9 @@ FOR each as_of_date T in sorted_dates:
             'FACTOR_NAME_2': factor_names[l],
             'COVARIANCE': cov_matrix[k, l]
         })
+
+# Save covariance table to Parquet file
+covariance_table.to_parquet('factor_covariance.parquet')
 ```
 
 **Output Table**: `COVARIANCE`
@@ -749,16 +928,19 @@ EDS   | 2020-03-31 | PROFITABILITY | PROFITABILITY       | 0.00012
 ...
 ```
 
+**Note**: The covariance matrix is calculated for all dates starting from 2020-01-01 (after sufficient history is available). The results are saved to Parquet format for efficient storage and fast loading in Step 9.
+
 **Note**: 
-- The covariance matrix is calculated and saved as an output table
+- The covariance matrix is calculated and saved as an output table (Parquet format)
 - It is also used internally in Step 9 for specific risk calculation
 - The calculation uses optimized window indexing for better performance
+- **Timing**: This step runs AFTER Steps 6-7 are complete, using the full history of factor returns
 
 ---
 
 ### STEP 9: Calculate Specific Risk
 
-**Objective**: Calculate specific risk for each stock, which is the portion of total variance not explained by factors.
+**Objective**: Calculate specific risk for each stock, which is the portion of total variance not explained by factors. **This step is performed AFTER all daily factor returns have been calculated (starting from 2020-01-01) and AFTER the factor covariance matrix has been calculated in Step 8.**
 
 #### 9.1 Specific Risk Calculation
 
@@ -773,7 +955,7 @@ total_var[i,T] = Var(returns[i, T-window+1:T])
 # Factor variance = β_i,T^T * Σ_f(T) * β_i,T
 # Where:
 # - β_i,T = exposure vector for stock i on date T
-# - Σ_f(T) = factor covariance matrix on date T (calculated internally in Step 8)
+# - Σ_f(T) = factor covariance matrix on date T (calculated in Step 8)
 
 factor_var[i,T] = β_i,T^T @ Σ_f(T) @ β_i,T
 
@@ -782,6 +964,8 @@ factor_var[i,T] = β_i,T^T @ Σ_f(T) @ β_i,T
 specific_var[i,T] = max(total_var[i,T] - factor_var[i,T], epsilon)
 # epsilon = 1e-8 (small positive value to avoid negative variance)
 ```
+
+**Important**: This calculation is performed **after Steps 6, 7, and 8 are complete** (i.e., after all factor returns, specific returns, and factor covariance matrices have been calculated for all dates from 2020-01-01 onwards). This allows us to use the complete history of returns and factor returns for the rolling window calculations.
 
 #### 9.2 Vectorized Implementation (Optimized)
 
@@ -823,31 +1007,65 @@ The specific risk calculation uses **fully vectorized operations** to process al
 
 **Implementation Details:**
 ```python
-# For each date T:
-# 1. Calculate factor covariance matrix once (cached)
-factor_cov_matrix = factor_returns_window[factor_names_for_cov].cov().values
+# STEP 9: Calculate Specific Risk
+# (Performed AFTER Steps 6, 7, and 8 are complete)
 
-# 2. Vectorize total variance for all stocks
-returns_pivot = returns_window.pivot_table(
-    index='SECURITY_ID',
-    columns='DATE',
-    values='ONE_DAY_PCT'
-)
-total_vars = returns_pivot.var(axis=1, ddof=0)  # All stocks at once
+# Load all required data
+factor_returns_df = load_factor_returns()  # From Step 6
+exposures_df = load_exposures()  # From Step 5
+returns_df = load_returns()  # All returns from 2020-01-01
+factor_covariance_df = load_factor_covariance()  # From Step 8
 
-# 3. Build exposure matrix B (N stocks × K factors)
-B = np.zeros((N, K))
-# Fill B with exposures (missing = 0)
+# Get all dates for which we have exposures and factor returns
+all_dates = sorted(set(exposures_df.index.get_level_values('DATE')) & 
+                  set(factor_returns_df['DATE']))
 
-# 4. Vectorize factor variance calculation
-tmp = B @ factor_cov_matrix  # (N, K)
-factor_vars = np.einsum('nk,nk->n', tmp, B)  # All N factor variances
+FOR each as_of_date T in all_dates:
+    # 1. Get factor covariance matrix for date T (from Step 8)
+    factor_cov_matrix = get_covariance_matrix(factor_covariance_df, T)
+    
+    # 2. Get returns window: [T - window + 1, T]
+    window_start_date = T - timedelta(days=window)
+    returns_window = returns_df[
+        (returns_df['DATE'] >= window_start_date) & 
+        (returns_df['DATE'] <= T)
+    ]
+    
+    # 3. Vectorize total variance for all stocks
+    returns_pivot = returns_window.pivot_table(
+        index='SECURITY_ID',
+        columns='DATE',
+        values='ONE_DAY_PCT'
+    )
+    total_vars = returns_pivot.var(axis=1, ddof=0)  # All stocks at once
+    
+    # 4. Get exposures for date T
+    exposures_T = exposures_df[exposures_df.index.get_level_values('DATE') == T]
+    
+    # 5. Build exposure matrix B (N stocks × K factors)
+    B = build_exposure_matrix(exposures_T, factor_names)  # (N, K)
+    
+    # 6. Vectorize factor variance calculation
+    tmp = B @ factor_cov_matrix  # (N, K)
+    factor_vars = np.einsum('nk,nk->n', tmp, B)  # All N factor variances
+    
+    # 7. Calculate specific variance for all stocks (vectorized)
+    specific_vars = np.maximum(
+        total_vars - factor_vars,
+        epsilon
+    )
+    
+    # 8. Store results
+    FOR each stock i:
+        specific_risk_table.append({
+            'MODEL': 'EDS_MODEL',
+            'DATE': T,
+            'SECURITY_ID': stock_id[i],
+            'SPECIFIC_VAR': specific_vars[i]
+        })
 
-# 5. Calculate specific variance for all stocks (vectorized)
-specific_vars = np.maximum(
-    total_vars - factor_vars_capped,
-    min_specific_vars
-)
+# Save specific risk table to Parquet file
+specific_risk_table.to_parquet('specific_risk.parquet')
 ```
 
 **Output Table**: `SPECIFIC_RISK`
@@ -863,7 +1081,8 @@ EDS   | 2020-03-31 | DEF456      | 0.00010
 - The specific risk table contains `SPECIFIC_VAR`: Specific variance = TOTAL_VAR - FACTOR_VAR
 - TOTAL_VAR: Total variance of stock returns (60-day rolling)
 - FACTOR_VAR: Variance explained by factors (β^T * Σ_f * β)
-- Factor covariance is calculated internally but not saved as a separate output table
+- Factor covariance is calculated in Step 8 and saved as a separate output table
+- **Timing**: This step runs AFTER Steps 6-8 are complete, using the full history of returns and factor returns
 
 ---
 
@@ -946,35 +1165,317 @@ EDS   | Intercept                        | Market Factor
 - **Columns**: MODEL, DATE, SECURITY_ID, FACTOR_NAME, EXPOSURE
 - **Content**: Factor exposures (z-scores for style factors, centered dummies for sector/continent)
 - **Format**: Long format (one row per stock-date-factor combination)
-- **Output File**: `exposures.csv`
+- **Output File**: `exposures.parquet`
 
 ### 2. FACTOR_RETURNS Table
 - **Columns**: MODEL, DATE, FACTOR_NAME, RETURN
 - **Content**: Daily factor returns estimated via cross-sectional OLS regression
-- **Note**: Includes INTERCEPT if configured
-- **Output File**: `factor_returns.csv`
+- **Note**: Includes INTERCEPT if configured. Calculated for all dates from 2020-01-01 onwards.
+- **Output File**: `factor_returns.parquet`
 
 ### 3. SPECIFIC_RETURNS Table
 - **Columns**: MODEL, DATE, SECURITY_ID, SPECIFIC_RETURN
-- **Content**: Idiosyncratic returns (residuals from factor model)
-- **Output File**: `specific_returns.csv`
+- **Content**: Idiosyncratic returns (residuals from factor model). Calculated for all dates from 2020-01-01 onwards.
+- **Output File**: `specific_returns.parquet`
 
 ### 4. SPECIFIC_RISK Table
 - **Columns**: MODEL, DATE, SECURITY_ID, SPECIFIC_VAR
 - **Content**: Specific variance for each stock (calculated as total variance minus factor variance)
-- **Output File**: `specific_risk.csv`
+- **Note**: Calculated AFTER Steps 6-8 are complete, using full history of returns and factor returns.
+- **Output File**: `specific_risk.parquet`
 
 ### 5. COVARIANCE Table
 - **Columns**: MODEL, DATE, FACTOR_NAME_1, FACTOR_NAME_2, COVARIANCE
 - **Content**: Factor covariance matrix (60-day rolling window)
-- **Output File**: `factor_covariance.csv`
+- **Note**: Calculated AFTER Steps 6-7 are complete, using full history of factor returns from 2020-01-01 onwards.
+- **Output File**: `factor_covariance.parquet`
 
 ### 6. FACTOR_MODEL_FACTOR_NAMES Table
 - **Columns**: MODEL, FACTOR_DISPLAY_NAME, FACTOR_GROUP
 - **Content**: Metadata mapping factor names to display names and groups
-- **Output File**: `factor_model_factor_names.csv`
+- **Output File**: `factor_model_factor_names.parquet`
 
-**Note**: Factor covariance matrix (Step 8) is saved as an output table and is also used internally in Step 9 for specific risk calculation.
+**Note**: 
+- All output tables are saved in **Parquet format** for efficient storage and fast loading (typically 5-10x faster than CSV for large datasets)
+- Factor covariance matrix (Step 8) is saved as an output table and is also used internally in Step 9 for specific risk calculation
+- **Workflow Order**: Steps 1-7 are performed first (exposures, factor returns, specific returns), then Steps 8-9 are performed at the end (covariance, specific risk) using the complete history
+
+---
+
+## Performance Optimization Best Practices
+
+This section outlines key optimization strategies to significantly reduce computation time and memory usage for large-scale factor model calculations.
+
+### Core Optimization Principles
+
+#### 1. Never Load Large Parquet Files in Daily Loops
+
+**Problem**: Loading entire Parquet files (prices/returns/fundamentals) repeatedly in daily loops causes massive I/O overhead and memory pressure.
+
+**Solution**: Use **streaming/chunked reads** with date filters, reading only the columns and date ranges needed.
+
+**Current Implementation**:
+- ✅ Already using `iter_batches()` for chunked reading
+- ✅ Filtering by date range during batch processing
+- ⚠️ **Can Improve**: Use PyArrow filters at the Parquet level instead of filtering after loading
+
+**Recommended Approach**:
+```python
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+
+# Use PyArrow dataset with pushdown filters (faster than loading then filtering)
+dataset = ds.dataset('prices.parquet', format='parquet')
+filtered = dataset.to_table(
+    filter=ds.field('DATE') == target_date,
+    columns=['FACTSET_ID', 'DATE', 'ADJUSTED_PRICE', 'ADJUSTED_VOLUME']
+)
+prices_t = filtered.to_pandas()
+```
+
+**Benefits**:
+- **Pushdown filtering**: Parquet engine filters at read time, not in memory
+- **Column pruning**: Only reads needed columns, reducing I/O by 50-80%
+- **No intermediate DataFrames**: Direct conversion to needed format
+
+#### 2. Use Ring Buffers for Rolling Characteristics (Not Pandas Rolling)
+
+**Problem**: Using `pandas.groupby().rolling()` on full cross-sections (70K stocks × hundreds of days) is extremely slow and memory-intensive.
+
+**Solution**: Use **ring buffers** to maintain rolling state per stock, updating incrementally each day.
+
+**Current Implementation**:
+- ✅ Already using `StockCalculatorManager` with ring buffers
+- ✅ Maintains rolling windows for momentum (252d), volatility (60d), liquidity (20d)
+
+**Key Benefits**:
+- **O(N) per day**: Each stock's buffer updated in O(1), total O(N) for N stocks
+- **Fixed memory**: Each stock uses constant memory (e.g., 252 floats for momentum)
+- **No full-table scans**: Avoids O(N×T) operations of pandas rolling
+
+**Example**:
+```python
+# Each day, only update buffers (O(N))
+for stock in stocks:
+    calculator_manager.update_stock(
+        stock.factset_id,
+        date,
+        return_value,
+        dollar_volume
+    )
+
+# Then retrieve characteristics (O(N))
+momentum = calculator_manager.get_momentum(stock.factset_id)
+volatility = calculator_manager.get_volatility(stock.factset_id)
+```
+
+#### 3. Date-Partitioned Output Files for Resume Capability
+
+**Problem**: If the pipeline crashes, you must restart from the beginning, losing hours of computation.
+
+**Solution**: Save outputs in **date-partitioned Parquet format**, allowing resume from the last completed date.
+
+**Recommended Output Structure**:
+```
+results/
+├── exposures/
+│   ├── date=2020-01-01/
+│   │   └── part-0.parquet
+│   ├── date=2020-01-02/
+│   │   └── part-0.parquet
+│   └── ...
+├── factor_returns.parquet  # Or date-partitioned: factor_returns/date=.../
+├── specific_returns/
+│   ├── date=2020-01-01/
+│   │   └── part-0.parquet
+│   └── ...
+└── specific_risk/
+    ├── date=2020-01-01/
+    │   └── part-0.parquet
+    └── ...
+```
+
+**Benefits**:
+- **Resume capability**: Check which dates are complete, skip them on restart
+- **Parallel processing**: Different workers can process different dates
+- **Incremental updates**: Only reprocess changed dates
+- **Efficient queries**: Read only needed date ranges
+
+**Implementation**:
+```python
+# Save exposures per date
+exposures_dir = Path('results/exposures')
+date_dir = exposures_dir / f"date={date.strftime('%Y-%m-%d')}"
+date_dir.mkdir(parents=True, exist_ok=True)
+exposures_df.to_parquet(date_dir / 'part-0.parquet', index=False)
+
+# Check if date already processed (for resume)
+if (date_dir / 'part-0.parquet').exists():
+    continue  # Skip already processed dates
+```
+
+#### 4. Optimize Low-Frequency Data Lookups (Fundamentals, FX, EV)
+
+**Problem**: Merging large fundamentals/enterprise_value tables every day is slow (e.g., 70s for enterprise_value).
+
+**Solution**: Pre-process low-frequency data into **asof-joined lookup structures** indexed by SECURITY_ID and date.
+
+**Recommended Approach**:
+```python
+# Pre-process fundamentals into asof lookup (once, not per date)
+fundamentals_sorted = fundamentals_df.sort_values(['FACTSET_ID', 'DATE'])
+fundamentals_indexed = fundamentals_sorted.set_index(['FACTSET_ID', 'DATE'])
+
+# For each date, use searchsorted to find latest available fundamental
+def get_latest_fundamental(factset_id, target_date):
+    # Binary search for latest date <= target_date
+    idx = fundamentals_indexed.loc[factset_id].index.searchsorted(target_date, side='right') - 1
+    if idx >= 0:
+        return fundamentals_indexed.loc[(factset_id, fundamentals_indexed.loc[factset_id].index[idx])]
+    return None
+```
+
+**Benefits**:
+- **O(log N) lookup**: Binary search instead of full table scan
+- **No daily merge**: Pre-computed lookup structure
+- **Memory efficient**: Only store latest available fundamental per stock
+
+#### 5. Column Selection: Only Read What You Need
+
+**Problem**: Reading all columns from Parquet files wastes I/O bandwidth and memory.
+
+**Solution**: Explicitly specify `columns` parameter when reading Parquet files.
+
+**Current Implementation**:
+- ⚠️ **Can Improve**: Currently reading all columns, then selecting needed ones
+
+**Recommended**:
+```python
+# Only read needed columns
+prices_df = pd.read_parquet(
+    'prices.parquet',
+    columns=['FACTSET_ID', 'DATE', 'ADJUSTED_PRICE', 'ADJUSTED_VOLUME']
+)
+
+# Or with PyArrow dataset
+dataset = ds.dataset('prices.parquet')
+table = dataset.to_table(columns=['FACTSET_ID', 'DATE', 'ADJUSTED_PRICE'])
+```
+
+**Benefits**:
+- **50-80% I/O reduction**: Only read needed columns
+- **Faster parsing**: Less data to process
+- **Lower memory**: Smaller DataFrames
+
+#### 6. Decouple Specific Risk Calculation from Main Pipeline
+
+**Problem**: Specific risk calculation requires 60 days of history, causing complex dependency management.
+
+**Solution**: Calculate specific risk **after** all factor returns and specific returns are complete, using only the `specific_returns` files.
+
+**Current Implementation**:
+- ✅ Already documented: Specific risk calculated in Phase 2 (after Steps 6-7)
+- ✅ Uses complete history of specific returns
+
+**Benefits**:
+- **No dependency on raw data**: Only needs `specific_returns.parquet`
+- **Can run separately**: Independent pipeline stage
+- **Easier to parallelize**: Process by date range or stock chunks
+
+**Implementation**:
+```python
+# Stage 5: Specific Risk (separate pipeline)
+# Only reads specific_returns, no need for exposures/factor_returns/raw data
+
+specific_returns_df = pd.read_parquet('specific_returns.parquet')
+
+for date in trading_dates:
+    # Get 60-day window of specific returns
+    window_start = date - timedelta(days=60)
+    returns_window = specific_returns_df[
+        (specific_returns_df['DATE'] >= window_start) & 
+        (specific_returns_df['DATE'] <= date)
+    ]
+    
+    # Calculate rolling std for each stock
+    specific_risk = returns_window.groupby('SECURITY_ID')['SPECIFIC_RETURN'].std()
+    
+    # Save per date
+    save_to_parquet(specific_risk, f'specific_risk/date={date}/part-0.parquet')
+```
+
+### Parallelization Strategy
+
+**Key Insight**: Not all stages can be parallelized by date due to rolling dependencies.
+
+**Recommended Approach**:
+
+1. **Stage 2-3 (Rolling + Exposures)**: 
+   - **Sequential by date** (rolling state depends on previous dates)
+   - **Parallel by stock chunks** (process N stocks in parallel, each with its own rolling state)
+   - Example: 4 workers, each processes 1/4 of stocks for each date
+
+2. **Stage 4 (Factor Returns + Specific Returns)**:
+   - **Can parallelize by date** (regression is independent per date)
+   - **But**: I/O may become bottleneck if too many workers read same files
+   - **Recommended**: 2-4 workers max, or sequential if I/O is slow
+
+3. **Stage 5 (Specific Risk)**:
+   - **Sequential by date** (rolling window depends on previous dates)
+   - **Parallel by stock chunks** (similar to Stage 2-3)
+
+**Example Parallelization**:
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+# Stage 2-3: Parallel by stock chunks
+def process_stock_chunk(stock_ids, date, ...):
+    # Each worker maintains its own rolling state
+    calculator_manager = StockCalculatorManager()
+    # Process stocks in this chunk
+    ...
+
+# Stage 4: Parallel by date (if I/O allows)
+def process_date(date):
+    # Read exposures and returns for this date
+    exposures = load_exposures(date)
+    returns = load_returns(date)
+    # Run regression
+    ...
+
+# Stage 5: Parallel by stock chunks
+def calculate_specific_risk_chunk(stock_ids, date, ...):
+    # Each worker processes its stock chunk
+    ...
+```
+
+### I/O Optimization Checklist
+
+- [ ] Use PyArrow filters for date filtering (pushdown filtering)
+- [ ] Specify `columns` parameter to only read needed columns
+- [ ] Use date-partitioned output structure for resume capability
+- [ ] Pre-process low-frequency data (fundamentals/FX/EV) into lookup structures
+- [ ] Use chunked reading (`iter_batches`) for large files
+- [ ] Consider Parquet compression (ZSTD + dictionary encoding for better compression)
+- [ ] Avoid loading entire quarter files when only one date is needed
+
+### Memory Optimization Checklist
+
+- [ ] Use ring buffers for rolling calculations (fixed memory per stock)
+- [ ] Process data in chunks, not full tables
+- [ ] Delete intermediate DataFrames after use (`del df; gc.collect()`)
+- [ ] Use `dtype` optimization (e.g., `float32` instead of `float64` if precision allows)
+- [ ] Avoid copying large DataFrames (use views when possible)
+
+### Current Implementation Status
+
+- ✅ **Ring Buffers**: Implemented (`StockCalculatorManager`)
+- ✅ **Chunked Reading**: Implemented (`iter_batches`)
+- ✅ **Date Filtering**: Implemented (but can use PyArrow pushdown filters)
+- ⚠️ **Column Selection**: Can be improved (currently reads all columns)
+- ⚠️ **Date-Partitioned Output**: Not yet implemented (currently single CSV/Parquet files)
+- ⚠️ **AsOf Lookups**: Not yet implemented (currently merging full tables)
+- ✅ **Specific Risk Decoupling**: Documented (calculated in Phase 2)
 
 ---
 
@@ -985,18 +1486,41 @@ EDS   | Intercept                        | Market Factor
 - ✅ Step 4: Sector and continent dummies with sum-to-zero (implemented, but needs developed/developing enhancement)
 - ✅ Step 5: Exposure table construction (implemented)
 - ✅ Step 6: Factor returns via OLS regression (implemented)
+  - **Output**: `factor_returns.parquet` (Parquet format for fast loading)
 - ✅ Step 7: Specific returns calculation (implemented)
+  - **Output**: `specific_returns.parquet` (Parquet format)
 - ✅ Step 8: Factor covariance matrix (implemented and saved as output)
   - **Optimization**: Uses efficient window indexing instead of filtering all dates
-  - **Output**: `factor_covariance.csv`
+  - **Timing**: Calculated AFTER Steps 6-7 are complete, using full history of factor returns
+  - **Output**: `factor_covariance.parquet` (Parquet format)
 - ✅ Step 9: Specific risk calculation (implemented with major vectorization optimizations)
   - **Performance**: Fully vectorized operations for 10-100x speedup
+  - **Timing**: Calculated AFTER Steps 6-8 are complete, using full history of returns and factor returns
   - **Key optimizations**: 
     - Vectorized total variance calculation (all stocks at once)
     - Vectorized factor variance calculation using matrix operations (`B @ Σ_f @ B^T` diagonal)
-    - Cached covariance matrix (calculated once per date)
+    - Cached covariance matrix (loaded from Step 8 output)
     - Pre-filtering and grouping for O(1) lookups
+  - **Output**: `specific_risk.parquet` (Parquet format)
 - ⚠️ Step 4 Enhancement: Need to add developed/developing country classification
+
+### Workflow Execution Order
+
+The workflow is executed in two phases:
+
+**Phase 1: Daily Calculations (Steps 1-7)**
+1. Steps 1-5: Calculate exposures for all dates from 2020-01-01 onwards
+2. Step 6: Calculate factor returns for all dates (using exposures)
+3. Step 7: Calculate specific returns for all dates (using factor returns)
+
+**Phase 2: End-of-Pipeline Calculations (Steps 8-9)**
+4. Step 8: Calculate factor covariance matrix for all dates (using complete history of factor returns from Step 6)
+5. Step 9: Calculate specific risk for all dates (using complete history of returns, exposures, and factor covariance from Step 8)
+
+This two-phase approach ensures that:
+- Steps 8-9 have access to the complete history of factor returns and returns
+- Rolling window calculations (60-day windows) can use the full dataset
+- No need to recalculate covariance/specific risk within the daily loop
 
 ### TODO Items
 1. **Developed/Developing Classification**: Create mapping of countries to "Developed" or "Developing" status
