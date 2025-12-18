@@ -12,6 +12,7 @@ from tqdm import tqdm
 from . import config
 from .ring_buffers import StockCalculatorManager
 from .continent_mapping import get_continent
+from .sequential_snapshot import FundamentalsSnapshot, EnterpriseValueSnapshot, ExchangeRatesSnapshot
 import time
 
 
@@ -190,41 +191,46 @@ def compute_exposures_for_quarter(
     return_mask = (all_returns['DATE'].values >= quarter_start_dt) & (all_returns['DATE'].values <= quarter_end_dt)
     quarter_returns = all_returns.iloc[return_mask].copy()
     
-    # Load fundamentals for this quarter only (chunked read to avoid memory issues)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loading fundamentals...")
+    # OPTIMIZATION: Use sequential snapshot for fundamentals (10-100x faster than date-filtered reads)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Initializing fundamentals snapshot...")
     fund_start = time.time()
-    quarter_fundamentals_chunks = []
+    fundamentals_snapshot = None
     try:
-        import pyarrow.parquet as pq
-        parquet_file = pq.ParquetFile(fundamentals_path)
-        batch_count = 0
-        for batch in parquet_file.iter_batches(batch_size=500000):  # Smaller chunks
-            batch_count += 1
-            if batch_count % 10 == 0:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Processed {batch_count} fundamental batches...")
-            chunk_df = batch.to_pandas()
-            
-            # Reset index to avoid duplicate label issues
-            chunk_df = chunk_df.reset_index(drop=True)
-            
-            chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
-            date_mask = (chunk_df['DATE'].values >= quarter_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
-            filtered = chunk_df.iloc[date_mask].copy()
-            
-            if len(filtered) > 0:
-                quarter_fundamentals_chunks.append(filtered)
-        quarter_fundamentals = pd.concat(quarter_fundamentals_chunks, ignore_index=True) if quarter_fundamentals_chunks else pd.DataFrame()
-        # Remove duplicate columns after concatenation
-        if len(quarter_fundamentals) > 0:
-            quarter_fundamentals = quarter_fundamentals.loc[:, ~quarter_fundamentals.columns.duplicated()]
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loaded {len(quarter_fundamentals):,} fundamental rows in {time.time() - fund_start:.1f}s")
+        fundamentals_snapshot = FundamentalsSnapshot(fundamentals_path)
+        fundamentals_snapshot.start()
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Fundamentals snapshot initialized in {time.time() - fund_start:.1f}s")
     except Exception as e:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error loading fundamentals for {year}Q{quarter}: {e}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error initializing fundamentals snapshot for {year}Q{quarter}: {e}")
         import traceback
         traceback.print_exc()
-        return {'processed': 0, 'skipped': 0, 'quarter': f"{year}Q{quarter}", 'csv_path': None}
+        # Fallback to old method if snapshot fails
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Falling back to date-filtered read...")
+        fund_start = time.time()
+        quarter_fundamentals_chunks = []
+        try:
+            import pyarrow.parquet as pq
+            parquet_file = pq.ParquetFile(fundamentals_path)
+            batch_count = 0
+            for batch in parquet_file.iter_batches(batch_size=500000):
+                batch_count += 1
+                if batch_count % 10 == 0:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Processed {batch_count} fundamental batches...")
+                chunk_df = batch.to_pandas()
+                chunk_df = chunk_df.reset_index(drop=True)
+                chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
+                date_mask = (chunk_df['DATE'].values >= quarter_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
+                filtered = chunk_df.iloc[date_mask].copy()
+                if len(filtered) > 0:
+                    quarter_fundamentals_chunks.append(filtered)
+            quarter_fundamentals = pd.concat(quarter_fundamentals_chunks, ignore_index=True) if quarter_fundamentals_chunks else pd.DataFrame()
+            if len(quarter_fundamentals) > 0:
+                quarter_fundamentals = quarter_fundamentals.loc[:, ~quarter_fundamentals.columns.duplicated()]
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loaded {len(quarter_fundamentals):,} fundamental rows in {time.time() - fund_start:.1f}s")
+        except Exception as e2:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error loading fundamentals for {year}Q{quarter}: {e2}")
+            return {'processed': 0, 'skipped': 0, 'quarter': f"{year}Q{quarter}", 'csv_path': None}
     
-    if len(quarter_prices) == 0 or len(quarter_fundamentals) == 0:
+    if len(quarter_prices) == 0:
         return {'processed': 0, 'skipped': 0, 'quarter': f"{year}Q{quarter}"}
     
     # Load market value data for this quarter (if available)
@@ -257,65 +263,73 @@ def compute_exposures_for_quarter(
             print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error loading market value for {year}Q{quarter}: {e}")
             quarter_market_value = pd.DataFrame()
     
-    # Load exchange rates for this quarter + lookback (if available)
-    all_exchange_rates = pd.DataFrame()
+    # OPTIMIZATION: Use sequential snapshot for exchange rates
+    exchange_rates_snapshot = None
     if exchange_rates_path and exchange_rates_path.exists():
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loading exchange rates...")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Initializing exchange rates snapshot...")
         exr_start = time.time()
         try:
-            import pyarrow.parquet as pq
-            parquet_file = pq.ParquetFile(exchange_rates_path)
-            exr_chunks = []
-            for batch in parquet_file.iter_batches(batch_size=500000):
-                chunk_df = batch.to_pandas()
-                
-                # Reset index to avoid duplicate label issues
-                chunk_df = chunk_df.reset_index(drop=True)
-                
-                chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
-                date_mask = (chunk_df['DATE'].values >= lookback_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
-                filtered = chunk_df.iloc[date_mask].copy()
-                
-                if len(filtered) > 0:
-                    exr_chunks.append(filtered)
-            all_exchange_rates = pd.concat(exr_chunks, ignore_index=True) if exr_chunks else pd.DataFrame()
-            # Remove duplicate columns after concatenation
-            if len(all_exchange_rates) > 0:
-                all_exchange_rates = all_exchange_rates.loc[:, ~all_exchange_rates.columns.duplicated()]
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loaded {len(all_exchange_rates):,} exchange rate rows in {time.time() - exr_start:.1f}s")
+            exchange_rates_snapshot = ExchangeRatesSnapshot(exchange_rates_path)
+            exchange_rates_snapshot.start()
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Exchange rates snapshot initialized in {time.time() - exr_start:.1f}s")
         except Exception as e:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error loading exchange rates for {year}Q{quarter}: {e}")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error initializing exchange rates snapshot: {e}")
+            # Fallback: load all exchange rates for quarter
             all_exchange_rates = pd.DataFrame()
+            try:
+                import pyarrow.parquet as pq
+                parquet_file = pq.ParquetFile(exchange_rates_path)
+                exr_chunks = []
+                for batch in parquet_file.iter_batches(batch_size=500000):
+                    chunk_df = batch.to_pandas()
+                    chunk_df = chunk_df.reset_index(drop=True)
+                    chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
+                    date_mask = (chunk_df['DATE'].values >= lookback_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
+                    filtered = chunk_df.iloc[date_mask].copy()
+                    if len(filtered) > 0:
+                        exr_chunks.append(filtered)
+                all_exchange_rates = pd.concat(exr_chunks, ignore_index=True) if exr_chunks else pd.DataFrame()
+                if len(all_exchange_rates) > 0:
+                    all_exchange_rates = all_exchange_rates.loc[:, ~all_exchange_rates.columns.duplicated()]
+            except Exception as e2:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error loading exchange rates: {e2}")
+                all_exchange_rates = pd.DataFrame()
+    else:
+        all_exchange_rates = pd.DataFrame()
     
-    # Load enterprise value data for this quarter (if available)
-    quarter_enterprise_value = pd.DataFrame()
+    # OPTIMIZATION: Use sequential snapshot for enterprise value (10-100x faster)
+    enterprise_value_snapshot = None
     if enterprise_value_path and enterprise_value_path.exists():
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loading enterprise value...")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Initializing enterprise value snapshot...")
         ev_start = time.time()
         try:
-            import pyarrow.parquet as pq
-            parquet_file = pq.ParquetFile(enterprise_value_path)
-            ev_chunks = []
-            for batch in parquet_file.iter_batches(batch_size=500000):
-                chunk_df = batch.to_pandas()
-                
-                # Reset index to avoid duplicate label issues
-                chunk_df = chunk_df.reset_index(drop=True)
-                
-                chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
-                date_mask = (chunk_df['DATE'].values >= quarter_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
-                filtered = chunk_df.iloc[date_mask].copy()
-                
-                if len(filtered) > 0:
-                    ev_chunks.append(filtered)
-            quarter_enterprise_value = pd.concat(ev_chunks, ignore_index=True) if ev_chunks else pd.DataFrame()
-            # Remove duplicate columns after concatenation
-            if len(quarter_enterprise_value) > 0:
-                quarter_enterprise_value = quarter_enterprise_value.loc[:, ~quarter_enterprise_value.columns.duplicated()]
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loaded {len(quarter_enterprise_value):,} enterprise value rows in {time.time() - ev_start:.1f}s")
+            enterprise_value_snapshot = EnterpriseValueSnapshot(enterprise_value_path)
+            enterprise_value_snapshot.start()
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Enterprise value snapshot initialized in {time.time() - ev_start:.1f}s")
         except Exception as e:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error loading enterprise value for {year}Q{quarter}: {e}")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error initializing enterprise value snapshot: {e}")
+            # Fallback: load all enterprise value for quarter
             quarter_enterprise_value = pd.DataFrame()
+            try:
+                import pyarrow.parquet as pq
+                parquet_file = pq.ParquetFile(enterprise_value_path)
+                ev_chunks = []
+                for batch in parquet_file.iter_batches(batch_size=500000):
+                    chunk_df = batch.to_pandas()
+                    chunk_df = chunk_df.reset_index(drop=True)
+                    chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
+                    date_mask = (chunk_df['DATE'].values >= quarter_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
+                    filtered = chunk_df.iloc[date_mask].copy()
+                    if len(filtered) > 0:
+                        ev_chunks.append(filtered)
+                quarter_enterprise_value = pd.concat(ev_chunks, ignore_index=True) if ev_chunks else pd.DataFrame()
+                if len(quarter_enterprise_value) > 0:
+                    quarter_enterprise_value = quarter_enterprise_value.loc[:, ~quarter_enterprise_value.columns.duplicated()]
+            except Exception as e2:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Error loading enterprise value: {e2}")
+                quarter_enterprise_value = pd.DataFrame()
+    else:
+        quarter_enterprise_value = pd.DataFrame()
     
     trading_dates = sorted(quarter_prices['DATE'].unique())
     
@@ -328,16 +342,23 @@ def compute_exposures_for_quarter(
     if len(trading_dates) == 0:
         return {'processed': 0, 'skipped': 0, 'quarter': f"{year}Q{quarter}", 'csv_path': None}
     
-    # OPTIMIZATION: Index DataFrames by DATE for O(1) lookups
+    # OPTIMIZATION: Index DataFrames by DATE for O(1) lookups (only for high-frequency data)
     # Remove duplicate columns first to avoid issues
     quarter_prices = quarter_prices.loc[:, ~quarter_prices.columns.duplicated()]
     quarter_returns = quarter_returns.loc[:, ~quarter_returns.columns.duplicated()]
-    quarter_fundamentals = quarter_fundamentals.loc[:, ~quarter_fundamentals.columns.duplicated()]
+    # Note: fundamentals now use snapshot, so we don't need to index it
+    # But keep for fallback compatibility
+    if fundamentals_snapshot is None:
+        if 'quarter_fundamentals' in locals() and len(quarter_fundamentals) > 0:
+            quarter_fundamentals = quarter_fundamentals.loc[:, ~quarter_fundamentals.columns.duplicated()]
     
     # Ensure DATE columns are 1D (not DataFrame)
-    for df_name, df in [('prices', quarter_prices), ('returns', quarter_returns), ('fundamentals', quarter_fundamentals)]:
+    for df_name, df in [('prices', quarter_prices), ('returns', quarter_returns)]:
         if 'DATE' in df.columns and isinstance(df['DATE'], pd.DataFrame):
             df['DATE'] = df['DATE'].iloc[:, 0]
+    if fundamentals_snapshot is None and 'quarter_fundamentals' in locals() and len(quarter_fundamentals) > 0:
+        if 'DATE' in quarter_fundamentals.columns and isinstance(quarter_fundamentals['DATE'], pd.DataFrame):
+            quarter_fundamentals['DATE'] = quarter_fundamentals['DATE'].iloc[:, 0]
     
     if len(quarter_market_value) > 0:
         quarter_market_value = quarter_market_value.loc[:, ~quarter_market_value.columns.duplicated()]
@@ -356,7 +377,11 @@ def compute_exposures_for_quarter(
     
     quarter_prices_idx = quarter_prices.set_index('DATE', drop=False)
     quarter_returns_idx = quarter_returns.set_index('DATE', drop=False)
-    quarter_fundamentals_idx = quarter_fundamentals.set_index('DATE', drop=False)
+    # Only index fundamentals if not using snapshot (for fallback)
+    if fundamentals_snapshot is None:
+        quarter_fundamentals_idx = quarter_fundamentals.set_index('DATE', drop=False) if len(quarter_fundamentals) > 0 else None
+    else:
+        quarter_fundamentals_idx = None
     quarter_market_value_idx = quarter_market_value.set_index('DATE', drop=False) if len(quarter_market_value) > 0 else None
     quarter_enterprise_value_idx = quarter_enterprise_value.set_index('DATE', drop=False) if len(quarter_enterprise_value) > 0 else None
     all_exchange_rates_idx = all_exchange_rates.set_index('DATE', drop=False) if len(all_exchange_rates) > 0 else None
@@ -421,21 +446,52 @@ def compute_exposures_for_quarter(
     for i, date_T in enumerate(trading_dates):
         if i % 10 == 0 or i == len(trading_dates) - 1:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Processing date {i+1}/{len(trading_dates)} ({date_T})...")
-        # OPTIMIZATION: Use .loc with datetime index (O(1) lookup, not O(n) scan)
+        
+        # Advance snapshots to current date
+        if fundamentals_snapshot is not None:
+            fundamentals_snapshot.advance_to(date_T)
+        if enterprise_value_snapshot is not None:
+            enterprise_value_snapshot.advance_to(date_T)
+        if exchange_rates_snapshot is not None:
+            exchange_rates_snapshot.advance_to(date_T)
+        
+        # Get prices and returns for this date (high-frequency data, still use index lookup)
         try:
-            fundamentals_T = quarter_fundamentals_idx.loc[[date_T]].copy() if date_T in quarter_fundamentals_idx.index else pd.DataFrame()
             prices_T = quarter_prices_idx.loc[[date_T]].copy() if date_T in quarter_prices_idx.index else pd.DataFrame()
             returns_T = quarter_returns_idx.loc[[date_T]].copy() if date_T in quarter_returns_idx.index else pd.DataFrame()
         except (KeyError, TypeError):
             # Fallback if date not in index
-            fund_mask = (quarter_fundamentals['DATE'].values == date_T)
-            fundamentals_T = quarter_fundamentals.iloc[fund_mask].copy()
             price_mask = (quarter_prices['DATE'].values == date_T)
             prices_T = quarter_prices.iloc[price_mask].copy()
             return_mask = (quarter_returns['DATE'].values == date_T)
             returns_T = quarter_returns.iloc[return_mask].copy()
         
-        if len(fundamentals_T) == 0 or len(prices_T) == 0 or len(returns_T) == 0:
+        if len(prices_T) == 0 or len(returns_T) == 0:
+            skipped += 1
+            continue
+        
+        # Get fundamentals for stocks on this date using snapshot
+        if fundamentals_snapshot is not None:
+            # Get latest fundamentals for all stocks with prices/returns
+            stock_ids = list(set(prices_T['FACTSET_ID'].unique()) | set(returns_T['FACTSET_ID'].unique()))
+            fundamentals_list = []
+            for stock_id in stock_ids:
+                fund = fundamentals_snapshot.get_for_id(stock_id)
+                if fund:
+                    fundamentals_list.append(fund)
+            if fundamentals_list:
+                fundamentals_T = pd.DataFrame(fundamentals_list)
+            else:
+                fundamentals_T = pd.DataFrame()
+        else:
+            # Fallback to old method
+            try:
+                fundamentals_T = quarter_fundamentals_idx.loc[[date_T]].copy() if date_T in quarter_fundamentals_idx.index else pd.DataFrame()
+            except (KeyError, TypeError):
+                fund_mask = (quarter_fundamentals['DATE'].values == date_T)
+                fundamentals_T = quarter_fundamentals.iloc[fund_mask].copy()
+        
+        if len(fundamentals_T) == 0:
             skipped += 1
             continue
         
@@ -488,8 +544,24 @@ def compute_exposures_for_quarter(
                         how='left'
                     )
         
-        # Merge enterprise value data if available
-        if quarter_enterprise_value_idx is not None:
+        # Merge enterprise value data if available (using snapshot)
+        if enterprise_value_snapshot is not None:
+            # Get latest enterprise value for all stocks
+            stock_ids = df_T['FACTSET_ID'].unique()
+            ev_list = []
+            for stock_id in stock_ids:
+                ev = enterprise_value_snapshot.get_for_id(stock_id)
+                if ev:
+                    ev_list.append(ev)
+            if ev_list:
+                enterprise_value_T = pd.DataFrame(ev_list)
+                df_T = df_T.merge(
+                    enterprise_value_T[['FACTSET_ID', 'ENTERPRISE_VALUE']],
+                    on='FACTSET_ID',
+                    how='left'
+                )
+        elif quarter_enterprise_value_idx is not None:
+            # Fallback to old method
             try:
                 enterprise_value_T = quarter_enterprise_value_idx.loc[[date_T]].copy() if date_T in quarter_enterprise_value_idx.index else pd.DataFrame()
                 if len(enterprise_value_T) > 0:
@@ -499,7 +571,6 @@ def compute_exposures_for_quarter(
                         how='left'
                     )
             except (KeyError, TypeError):
-                # Fallback if date not in index
                 enterprise_value_T = quarter_enterprise_value[quarter_enterprise_value['DATE'] == date_T].copy()
                 if len(enterprise_value_T) > 0:
                     df_T = df_T.merge(
@@ -513,16 +584,28 @@ def compute_exposures_for_quarter(
             continue
         
         # Calculate SIZE characteristic (log of market cap in USD)
-        if 'MARKETCAP' in df_T.columns and len(all_exchange_rates) > 0:
-            # Get exchange rates for this date
+        if 'MARKETCAP' in df_T.columns:
+            # Get exchange rates for this date (using snapshot if available)
             exchange_rates_T = pd.DataFrame()
-            if all_exchange_rates_idx is not None:
-                try:
-                    exchange_rates_T = all_exchange_rates_idx.loc[[date_T]].copy() if date_T in all_exchange_rates_idx.index else pd.DataFrame()
-                except (KeyError, TypeError):
+            if exchange_rates_snapshot is not None:
+                # Get unique currencies for stocks on this date
+                currencies = df_T['CURRENCY'].unique() if 'CURRENCY' in df_T.columns else []
+                if len(currencies) > 0:
+                    # Get exchange rates for all currencies
+                    fx_dict = exchange_rates_snapshot.get_for_currencies(list(currencies), date_T)
+                    # Convert to DataFrame
+                    fx_list = [fx_dict[curr] for curr in currencies if fx_dict[curr] is not None]
+                    if fx_list:
+                        exchange_rates_T = pd.DataFrame(fx_list)
+            elif len(all_exchange_rates) > 0:
+                # Fallback to old method
+                if all_exchange_rates_idx is not None:
+                    try:
+                        exchange_rates_T = all_exchange_rates_idx.loc[[date_T]].copy() if date_T in all_exchange_rates_idx.index else pd.DataFrame()
+                    except (KeyError, TypeError):
+                        exchange_rates_T = all_exchange_rates[all_exchange_rates['DATE'] == date_T].copy()
+                else:
                     exchange_rates_T = all_exchange_rates[all_exchange_rates['DATE'] == date_T].copy()
-            else:
-                exchange_rates_T = all_exchange_rates[all_exchange_rates['DATE'] == date_T].copy() if len(all_exchange_rates) > 0 else pd.DataFrame()
             
             # Convert market cap from local currency to USD
             if len(exchange_rates_T) > 0 and 'EXCHANGE_RATE_TO_USD' in exchange_rates_T.columns:
