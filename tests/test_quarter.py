@@ -77,9 +77,9 @@ def test_quarter(
         print("✗ ERROR: No dates were processed.")
         return None
     
-    exposures_csv_path = exposure_stats.get('exposures_csv')
-    if not exposures_csv_path or not Path(exposures_csv_path).exists():
-        print("✗ ERROR: Exposures CSV file not found.")
+    exposures_parquet_dir = exposure_stats.get('exposures_parquet_dir')
+    if not exposures_parquet_dir or not Path(exposures_parquet_dir).exists():
+        print("✗ ERROR: Exposures Parquet directory not found.")
         return None
     
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Stage 2 completed in {time.time() - stage2_start:.1f}s")
@@ -91,25 +91,44 @@ def test_quarter(
     stage3_start = time.time()
     
     try:
-        print("Loading exposures from CSV...")
+        print("Loading exposures from Parquet (date-partitioned, wide format)...")
         with tqdm(total=1, desc="Loading exposures", bar_format='{desc}: {elapsed}') as pbar:
-            exposures_long_df = pd.read_csv(exposures_csv_path)
-            exposures_long_df['DATE'] = pd.to_datetime(exposures_long_df['DATE'])
+            # Read all date partitions and combine
+            exposure_chunks = []
+            date_dirs = sorted([d for d in Path(exposures_parquet_dir).iterdir() if d.is_dir() and d.name.startswith('date=')])
             
-            print(f"   ✓ Loaded {len(exposures_long_df):,} exposure observations")
-            print(f"   ✓ Date range: {exposures_long_df['DATE'].min()} to {exposures_long_df['DATE'].max()}")
-            print(f"   ✓ Unique dates: {exposures_long_df['DATE'].nunique()}")
-            print(f"   ✓ Unique securities: {exposures_long_df['SECURITY_ID'].nunique()}")
+            for date_dir in date_dirs:
+                parquet_files = list(date_dir.glob('*.parquet'))
+                for parquet_file in parquet_files:
+                    chunk = pd.read_parquet(parquet_file)
+                    exposure_chunks.append(chunk)
             
-            # Convert long format to wide format for regression calculations
-            exposures_df = exposures_long_df.pivot_table(
-                index=['SECURITY_ID', 'DATE'],
-                columns='FACTOR_NAME',
-                values='EXPOSURE',
-                aggfunc='first'
-            )
-            exposures_df = exposures_df.rename_axis(None, axis=1)
-            exposures_df = exposures_df.rename_axis(['FACTSET_ID', 'DATE'])
+            if not exposure_chunks:
+                raise ValueError("No exposure Parquet files found")
+            
+            # Combine all exposures
+            exposures_df = pd.concat(exposure_chunks, ignore_index=True)
+            
+            # Ensure DATE is datetime
+            exposures_df['DATE'] = pd.to_datetime(exposures_df['DATE'])
+            
+            # Set index to (FACTSET_ID, DATE) for regression calculations
+            if 'FACTSET_ID' in exposures_df.columns:
+                exposures_df = exposures_df.set_index(['FACTSET_ID', 'DATE'])
+            elif 'SECURITY_ID' in exposures_df.columns:
+                exposures_df = exposures_df.rename(columns={'SECURITY_ID': 'FACTSET_ID'})
+                exposures_df = exposures_df.set_index(['FACTSET_ID', 'DATE'])
+            else:
+                raise ValueError("Exposures DataFrame must have FACTSET_ID or SECURITY_ID column")
+            
+            # Remove MODEL column if present
+            if 'MODEL' in exposures_df.columns:
+                exposures_df = exposures_df.drop(columns=['MODEL'])
+            
+            print(f"   ✓ Loaded {len(exposures_df):,} exposure rows (wide format)")
+            print(f"   ✓ Date range: {exposures_df.index.get_level_values('DATE').min()} to {exposures_df.index.get_level_values('DATE').max()}")
+            print(f"   ✓ Unique dates: {exposures_df.index.get_level_values('DATE').nunique()}")
+            print(f"   ✓ Unique securities: {exposures_df.index.get_level_values('FACTSET_ID').nunique()}")
             pbar.update(1)
         
         # Load returns from Parquet
@@ -117,17 +136,36 @@ def test_quarter(
         returns_path = Path(data_dir) / 'returns.parquet'
         if returns_path.exists():
             returns_df = pd.read_parquet(returns_path)
+            
+            # Remove duplicate columns first
+            returns_df = returns_df.loc[:, ~returns_df.columns.duplicated()]
+            
             if 'FSYM_ID' in returns_df.columns:
                 returns_df = returns_df.rename(columns={'FSYM_ID': 'FACTSET_ID'})
+            
+            # Handle DATE column - prefer P_DATE if both exist
             if 'P_DATE' in returns_df.columns:
+                # If DATE also exists, drop it first to avoid duplicates
+                if 'DATE' in returns_df.columns:
+                    returns_df = returns_df.drop(columns=['DATE'])
                 returns_df = returns_df.rename(columns={'P_DATE': 'DATE'})
-            returns_df['DATE'] = pd.to_datetime(returns_df['DATE'])
+            elif 'DATE' not in returns_df.columns:
+                # No DATE column at all - skip
+                returns_df = pd.DataFrame()
+            
+            # Ensure DATE is a single column (not DataFrame) before converting
+            if len(returns_df) > 0 and 'DATE' in returns_df.columns:
+                if isinstance(returns_df['DATE'], pd.DataFrame):
+                    returns_df['DATE'] = returns_df['DATE'].iloc[:, 0]
+                returns_df['DATE'] = pd.to_datetime(returns_df['DATE'])
             
             # Filter to date range and trading dates from exposures
             trading_dates = exposures_df.index.get_level_values('DATE').unique()
             returns_df = returns_df[returns_df['DATE'].isin(trading_dates)]
-            print(f"   ✓ Unique securities in returns: {returns_df['FACTSET_ID'].nunique():,}")
-            print(f"   ✓ Unique dates in returns: {returns_df['DATE'].nunique():,}")
+            
+            if len(returns_df) > 0:
+                print(f"   ✓ Unique securities in returns: {returns_df['FACTSET_ID'].nunique():,}")
+                print(f"   ✓ Unique dates in returns: {returns_df['DATE'].nunique():,}")
         else:
             print("   ⚠ returns.parquet not found - please run bulk_download.py first")
             returns_df = pd.DataFrame()
@@ -137,7 +175,7 @@ def test_quarter(
         # Calculate factor returns
         print("Calculating factor returns...")
         with tqdm(total=1, desc="Factor returns", bar_format='{desc}: {elapsed}') as pbar:
-            model_builder = FactorModelBuilder(exposures_df, pd.Series(dtype=float))
+            model_builder = FactorModelBuilder()
             factor_returns_df = model_builder.calculate_daily_factor_returns(
                 exposures_df=exposures_df,
                 returns_df=returns_df
@@ -269,13 +307,8 @@ def test_quarter(
     stage7_start = time.time()
     
     try:
-        # Convert exposures to wide format for factor names
-        exposures_wide = exposures_long_df.pivot_table(
-            index=['SECURITY_ID', 'DATE'],
-            columns='FACTOR_NAME',
-            values='EXPOSURE',
-            aggfunc='first'
-        ).reset_index()
+        # Exposures are already in wide format, just reset index for factor names
+        exposures_wide = exposures_df.reset_index()
         
         # Generate factor names table
         with tqdm(total=1, desc="Factor names", bar_format='{desc}: {elapsed}') as pbar:
@@ -305,7 +338,7 @@ def test_quarter(
     print(f"✓ Processed {exposure_stats['processed']} dates")
     print(f"✓ All results saved to CSV files in: {output_dir}/")
     print("\nOutput CSV files:")
-    print(f"  - {output_path / 'exposures.csv'} (long format: MODEL, DATE, SECURITY_ID, FACTOR_NAME, EXPOSURE)")
+    print(f"  - {exposures_parquet_dir} (date-partitioned Parquet, wide format)")
     if factor_returns_df is not None:
         print(f"  - {output_path / 'factor_returns.csv'} (MODEL, DATE, FACTOR_NAME, RETURN)")
     if specific_returns_df is not None:
@@ -321,7 +354,7 @@ def test_quarter(
     return {
         'output_dir': output_dir,
         'processed': exposure_stats['processed'],
-        'exposures_count': len(exposures_long_df),
+        'exposures_count': len(exposures_df),
         'factor_returns_count': len(factor_returns_df) if factor_returns_df is not None else 0,
         'specific_returns_count': len(specific_returns_df) if specific_returns_df is not None else 0,
         'specific_risk_count': len(specific_risk_df) if specific_risk_df is not None else 0,

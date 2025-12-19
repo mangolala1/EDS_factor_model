@@ -76,9 +76,9 @@ def test_single_day(
         print("✗ ERROR: No dates were processed.")
         return None
     
-    exposures_csv_path = exposure_stats.get('exposures_csv')
-    if not exposures_csv_path or not Path(exposures_csv_path).exists():
-        print("✗ ERROR: Exposures CSV file not found.")
+    exposures_parquet_dir = exposure_stats.get('exposures_parquet_dir')
+    if not exposures_parquet_dir or not Path(exposures_parquet_dir).exists():
+        print("✗ ERROR: Exposures Parquet directory not found.")
         return None
     
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Stage 2 completed in {time.time() - stage2_start:.1f}s")
@@ -96,25 +96,39 @@ def test_single_day(
     model_builder = None
     
     try:
-        print("Loading exposures from CSV...")
+        print("Loading exposures from Parquet (date-partitioned, wide format)...")
         with tqdm(total=1, desc="Loading exposures", bar_format='{desc}: {elapsed}') as pbar:
-            exposures_long_df = pd.read_csv(exposures_csv_path)
-            exposures_long_df['DATE'] = pd.to_datetime(exposures_long_df['DATE'])
+            # Read all date partitions and combine
+            exposure_chunks = []
+            date_dirs = sorted([d for d in Path(exposures_parquet_dir).iterdir() if d.is_dir() and d.name.startswith('date=')])
             
-            # Load all exposures in the date range (needed for factor returns calculation)
-            # But we'll filter to test date for specific risk calculation later
-            print(f"   Loaded exposures for date range: {len(exposures_long_df):,} total exposure rows")
-            print(f"   Date range: {exposures_long_df['DATE'].min()} to {exposures_long_df['DATE'].max()}")
+            for date_dir in date_dirs:
+                parquet_files = list(date_dir.glob('*.parquet'))
+                for parquet_file in parquet_files:
+                    chunk = pd.read_parquet(parquet_file)
+                    exposure_chunks.append(chunk)
             
-            # Convert long format to wide format for regression calculations
-            exposures_df_all = exposures_long_df.pivot_table(
-                index=['SECURITY_ID', 'DATE'],
-                columns='FACTOR_NAME',
-                values='EXPOSURE',
-                aggfunc='first'
-            )
-            exposures_df_all = exposures_df_all.rename_axis(None, axis=1)
-            exposures_df_all = exposures_df_all.rename_axis(['FACTSET_ID', 'DATE'])
+            if not exposure_chunks:
+                raise ValueError("No exposure Parquet files found")
+            
+            # Combine all exposures
+            exposures_df_all = pd.concat(exposure_chunks, ignore_index=True)
+            
+            # Ensure DATE is datetime
+            exposures_df_all['DATE'] = pd.to_datetime(exposures_df_all['DATE'])
+            
+            # Set index to (FACTSET_ID, DATE) for regression calculations
+            if 'FACTSET_ID' in exposures_df_all.columns:
+                exposures_df_all = exposures_df_all.set_index(['FACTSET_ID', 'DATE'])
+            elif 'SECURITY_ID' in exposures_df_all.columns:
+                exposures_df_all = exposures_df_all.rename(columns={'SECURITY_ID': 'FACTSET_ID'})
+                exposures_df_all = exposures_df_all.set_index(['FACTSET_ID', 'DATE'])
+            else:
+                raise ValueError("Exposures DataFrame must have FACTSET_ID or SECURITY_ID column")
+            
+            # Remove MODEL column if present
+            if 'MODEL' in exposures_df_all.columns:
+                exposures_df_all = exposures_df_all.drop(columns=['MODEL'])
             
             # Keep all exposures for factor returns calculation
             exposures_df = exposures_df_all
@@ -125,7 +139,8 @@ def test_single_day(
             
             pbar.update(1)
         
-        print(f"   ✓ Loaded {len(exposures_long_df):,} exposure observations")
+        print(f"   ✓ Loaded {len(exposures_df_all):,} exposure rows (wide format)")
+        print(f"   ✓ Date range: {exposures_df_all.index.get_level_values('DATE').min()} to {exposures_df_all.index.get_level_values('DATE').max()}")
         print(f"   ✓ Exposures for test date ({test_date}): {len(exposures_df_test_date):,} rows")
         
         # Load returns from Parquet
@@ -318,19 +333,8 @@ def test_single_day(
     stage7_start = time.time()
     
     try:
-        # Load exposures for factor name extraction
-        exposures_for_names = pd.read_csv(exposures_csv_path)
-        
-        # Convert long format to wide format temporarily
-        if 'FACTOR_NAME' in exposures_for_names.columns:
-            exposures_wide_for_names = exposures_for_names.pivot_table(
-                index=['SECURITY_ID', 'DATE'],
-                columns='FACTOR_NAME',
-                values='EXPOSURE',
-                aggfunc='first'
-            ).reset_index()
-        else:
-            exposures_wide_for_names = exposures_for_names
+        # Exposures are already in wide format, just reset index for factor names
+        exposures_wide_for_names = exposures_df_all.reset_index()
         
         # Generate factor names table
         # Initialize model_builder if not already initialized
@@ -361,12 +365,13 @@ def test_single_day(
     
     # Display exposure table sample
     print("\n" + "=" * 80)
-    print("EXPOSURE TABLE SAMPLE (Long Format)")
+    print("EXPOSURE TABLE SAMPLE (Wide Format)")
     print("=" * 80)
-    exposures_sample = exposures_long_df.head(20)
-    print(f"Total exposure rows: {len(exposures_long_df):,}")
-    print(f"Unique securities: {exposures_long_df['SECURITY_ID'].nunique():,}")
-    print(f"Unique factors: {exposures_long_df['FACTOR_NAME'].nunique():,}")
+    exposures_sample = exposures_df_all.reset_index().head(20)
+    print(f"Total exposure rows: {len(exposures_df_all):,}")
+    print(f"Unique securities: {exposures_df_all.index.get_level_values('FACTSET_ID').nunique():,}")
+    print(f"Unique dates: {exposures_df_all.index.get_level_values('DATE').nunique():,}")
+    print(f"Factor columns: {len([c for c in exposures_df_all.columns if c not in ['FACTSET_ID', 'DATE']]):,}")
     print(f"\nSample rows:")
     print(exposures_sample.to_string(index=False))
     
@@ -378,7 +383,7 @@ def test_single_day(
     print(f"✓ Processed {exposure_stats['processed']} dates")
     print(f"✓ All results saved to CSV files in: {output_dir}/")
     print("\nOutput CSV files:")
-    print(f"  - {output_path / 'exposures.csv'} (long format)")
+    print(f"  - {exposures_parquet_dir} (date-partitioned Parquet, wide format)")
     if factor_returns_df is not None:
         print(f"  - {output_path / 'factor_returns.csv'}")
     if specific_returns_df is not None:
@@ -392,7 +397,7 @@ def test_single_day(
     return {
         'output_dir': output_dir,
         'processed': exposure_stats['processed'],
-        'exposures_count': len(exposures_long_df),
+        'exposures_count': len(exposures_df_all),
         'factor_returns_count': len(factor_returns_df) if factor_returns_df is not None else 0,
         'specific_returns_count': len(specific_returns_df) if specific_returns_df is not None else 0,
         'specific_risk_count': len(specific_risk_df) if specific_risk_df is not None else 0

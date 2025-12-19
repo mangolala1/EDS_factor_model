@@ -233,28 +233,39 @@ def compute_exposures_for_quarter(
     if len(quarter_prices) == 0:
         return {'processed': 0, 'skipped': 0, 'quarter': f"{year}Q{quarter}"}
     
-    # Load market value data for this quarter (if available)
+    # OPTIMIZATION: Load market value data for this quarter (only read needed columns)
     quarter_market_value = pd.DataFrame()
     if market_value_path and market_value_path.exists():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Loading market value...")
         mv_start = time.time()
         try:
             import pyarrow.parquet as pq
-            parquet_file = pq.ParquetFile(market_value_path)
-            mv_chunks = []
-            for batch in parquet_file.iter_batches(batch_size=500000):
-                chunk_df = batch.to_pandas()
-                
-                # Reset index to avoid duplicate label issues
-                chunk_df = chunk_df.reset_index(drop=True)
-                
-                chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
-                date_mask = (chunk_df['DATE'].values >= quarter_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
-                filtered = chunk_df.iloc[date_mask].copy()
-                
-                if len(filtered) > 0:
-                    mv_chunks.append(filtered)
-            quarter_market_value = pd.concat(mv_chunks, ignore_index=True) if mv_chunks else pd.DataFrame()
+            import pyarrow.dataset as ds
+            # OPTIMIZATION: Only read needed columns to reduce I/O
+            needed_columns = ['FACTSET_ID', 'DATE', 'MARKETCAP', 'CURRENCY']
+            try:
+                # Try using dataset with column selection (faster)
+                dataset = ds.dataset(market_value_path, format='parquet')
+                # Filter by date range and select columns
+                table = dataset.to_table(
+                    filter=(ds.field('DATE') >= quarter_start_dt) & (ds.field('DATE') <= quarter_end_dt),
+                    columns=needed_columns
+                )
+                quarter_market_value = table.to_pandas()
+            except Exception:
+                # Fallback to batch reading if dataset fails
+                parquet_file = pq.ParquetFile(market_value_path)
+                mv_chunks = []
+                for batch in parquet_file.iter_batches(batch_size=500000, columns=needed_columns):
+                    chunk_df = batch.to_pandas()
+                    chunk_df = chunk_df.reset_index(drop=True)
+                    chunk_df['DATE'] = pd.to_datetime(chunk_df['DATE'])
+                    date_mask = (chunk_df['DATE'].values >= quarter_start_dt) & (chunk_df['DATE'].values <= quarter_end_dt)
+                    filtered = chunk_df.iloc[date_mask].copy()
+                    if len(filtered) > 0:
+                        mv_chunks.append(filtered)
+                quarter_market_value = pd.concat(mv_chunks, ignore_index=True) if mv_chunks else pd.DataFrame()
+            
             # Remove duplicate columns after concatenation
             if len(quarter_market_value) > 0:
                 quarter_market_value = quarter_market_value.loc[:, ~quarter_market_value.columns.duplicated()]
@@ -265,6 +276,7 @@ def compute_exposures_for_quarter(
     
     # OPTIMIZATION: Use sequential snapshot for exchange rates
     exchange_rates_snapshot = None
+    all_exchange_rates = pd.DataFrame()  # Initialize to avoid UnboundLocalError
     if exchange_rates_path and exchange_rates_path.exists():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Initializing exchange rates snapshot...")
         exr_start = time.time()
@@ -299,6 +311,7 @@ def compute_exposures_for_quarter(
     
     # OPTIMIZATION: Use sequential snapshot for enterprise value (10-100x faster)
     enterprise_value_snapshot = None
+    quarter_enterprise_value = pd.DataFrame()  # Initialize to avoid UnboundLocalError
     if enterprise_value_path and enterprise_value_path.exists():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Initializing enterprise value snapshot...")
         ev_start = time.time()
@@ -722,9 +735,32 @@ def compute_exposures_for_quarter(
             char_data_clipped = np.clip(char_data, lower_bounds, upper_bounds)
             
             # Standardize in one pass (vectorized) - compute mean/std across stocks (axis=0)
-            char_means = np.nanmean(char_data_clipped, axis=0)  # (K,) means
-            char_stds = np.nanstd(char_data_clipped, axis=0, ddof=0)  # (K,) stds
-            char_stds = np.where(char_stds > 0, char_stds, 1.0)  # Avoid division by zero
+            # OPTIMIZATION: Column-level guard to avoid NaN warnings and handle empty columns
+            char_means = np.zeros(char_data_clipped.shape[1], dtype=np.float64)
+            char_stds = np.ones(char_data_clipped.shape[1], dtype=np.float64)
+            
+            # Process each column separately to handle empty/NaN columns gracefully
+            min_valid_samples = 2  # Need at least 2 samples for std calculation
+            for col_idx in range(char_data_clipped.shape[1]):
+                col_data = char_data_clipped[:, col_idx]
+                valid_mask = np.isfinite(col_data)
+                valid_count = valid_mask.sum()
+                
+                if valid_count >= min_valid_samples:
+                    # Calculate mean and std only on valid values
+                    valid_data = col_data[valid_mask]
+                    char_means[col_idx] = np.mean(valid_data)
+                    std_val = np.std(valid_data, ddof=0)
+                    char_stds[col_idx] = std_val if std_val > 0 else 1.0
+                elif valid_count == 1:
+                    # Only one valid value: mean = that value, std = 1 (no standardization)
+                    char_means[col_idx] = col_data[valid_mask][0]
+                    char_stds[col_idx] = 1.0
+                else:
+                    # No valid values or only one: set mean=0, std=1 (will result in NaN preserved)
+                    char_means[col_idx] = 0.0
+                    char_stds[col_idx] = 1.0
+            
             # Broadcast: (N, K) - (K,) / (K,) = (N, K)
             char_data_standardized = (char_data_clipped - char_means) / char_stds
             
@@ -892,55 +928,60 @@ def compute_exposures_for_quarter(
     
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Date processing completed in {time.time() - process_start:.1f}s ({processed} processed, {skipped} skipped)")
     
-    # Write quarter exposures to CSV file
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Writing CSV file...")
+    # Write quarter exposures to Parquet files (date-partitioned, wide format)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Writing Parquet files (date-partitioned)...")
     write_start = time.time()
-    csv_path = None
+    parquet_dir = None
     if all_exposures:
-        # Fix: Ensure all DataFrames have the same columns before concatenating
-        # This prevents FutureWarning about all-NA columns
-        if len(all_exposures) > 1:
-            # Get union of all columns across all dates
-            all_columns = set()
-            for df in all_exposures:
-                all_columns.update(df.columns)
-            all_columns = sorted(list(all_columns))
-            
-            # Reindex each DataFrame to have all columns (fill missing with 0 for dummies, NaN for factors)
-            aligned_exposures = []
-            for df in all_exposures:
-                # Create new DataFrame with all columns
-                df_aligned = pd.DataFrame(index=df.index, columns=all_columns)
-                # Copy existing columns
-                for col in df.columns:
-                    df_aligned[col] = df[col]
-                # Fill missing dummy columns with 0 (they should be 0 if sector/continent not present)
-                for col in all_columns:
-                    if col not in df.columns:
-                        if col.startswith('SECTOR_') or col.startswith('CONTINENT_'):
-                            df_aligned[col] = 0.0
-                        else:
-                            df_aligned[col] = np.nan
-                aligned_exposures.append(df_aligned)
-            
-            combined_exposures = pd.concat(aligned_exposures, ignore_index=True)
-        else:
-            combined_exposures = all_exposures[0]
+        # Get union of all columns across all dates for alignment
+        all_columns = set()
+        for df in all_exposures:
+            all_columns.update(df.columns)
+        all_columns = sorted(list(all_columns))
         
-        # Ensure DATE is formatted as string
-        if 'DATE' in combined_exposures.columns:
-            combined_exposures['DATE'] = pd.to_datetime(combined_exposures['DATE']).dt.strftime('%Y-%m-%d')
+        # Create date-partitioned Parquet directory structure
+        exposures_dir = output_dir / 'exposures'
+        exposures_dir.mkdir(parents=True, exist_ok=True)
         
-        # Write to CSV (one file per quarter for parallel processing)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = output_dir / f'exposures_{year}Q{quarter}.csv'
-        combined_exposures.to_csv(csv_path, index=False)
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Wrote {len(combined_exposures):,} rows to CSV in {time.time() - write_start:.1f}s")
+        files_written = 0
+        total_rows = 0
+        
+        # Write each date as a separate Parquet file (wide format)
+        for exposures_df in all_exposures:
+            # Align columns (fill missing with 0 for dummies, NaN for factors)
+            df_aligned = pd.DataFrame(index=exposures_df.index, columns=all_columns)
+            for col in exposures_df.columns:
+                df_aligned[col] = exposures_df[col]
+            # Fill missing dummy columns with 0
+            for col in all_columns:
+                if col not in exposures_df.columns:
+                    if col.startswith('SECTOR_') or col.startswith('CONTINENT_'):
+                        df_aligned[col] = 0.0
+                    else:
+                        df_aligned[col] = np.nan
+            
+            # Get date for partitioning
+            date_val = pd.to_datetime(df_aligned['DATE'].iloc[0])
+            date_str = date_val.strftime('%Y-%m-%d')
+            
+            # Create date partition directory
+            date_dir = exposures_dir / f'date={date_str}'
+            date_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Write Parquet file (wide format: FACTSET_ID, DATE, factor columns)
+            parquet_path = date_dir / 'part-0.parquet'
+            df_aligned.to_parquet(parquet_path, index=False, compression='snappy')
+            
+            files_written += 1
+            total_rows += len(df_aligned)
+        
+        parquet_dir = exposures_dir
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: Wrote {files_written} date partitions ({total_rows:,} rows) to Parquet in {time.time() - write_start:.1f}s")
     
     total_time = time.time() - start_time
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {year}Q{quarter}: COMPLETE in {total_time:.1f}s total")
     
-    return {'processed': processed, 'skipped': skipped, 'quarter': f"{year}Q{quarter}", 'csv_path': csv_path}
+    return {'processed': processed, 'skipped': skipped, 'quarter': f"{year}Q{quarter}", 'parquet_dir': parquet_dir}
 
 
 def process_quarters_parallel(
@@ -1041,15 +1082,16 @@ def process_quarters_parallel(
     if max_workers is None:
         # REDUCE workers to avoid memory issues - each worker loads full DataFrames
         # With 19 workers and 50M row DataFrames, we'd need 19 * 500MB = 9.5GB+ just for data copies
-        max_workers = min(4, max(1, os.cpu_count() - 1))  # Limit to 4 workers max
+        # OPTIMIZATION: Use 1-2 workers to avoid IO contention
+        # 4 workers caused 281s market value load vs 16s with 1 worker
+        # Parallel processing amplifies I/O overhead when reading same Parquet files
+        max_workers = min(2, max(1, os.cpu_count() - 1))  # Limit to 2 workers max to avoid IO contention
     
     print(f"   Using {max_workers} parallel workers (limited to avoid memory issues)")
     
     # Process quarters in parallel
     processed_total = 0
     skipped_total = 0
-    
-    quarter_csv_files = []
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_quarter = {
@@ -1069,46 +1111,19 @@ def process_quarters_parallel(
                 result = future.result()
                 processed_total += result['processed']
                 skipped_total += result['skipped']
-                if result.get('csv_path'):
-                    quarter_csv_files.append(result['csv_path'])
             except Exception as e:
                 print(f"\n⚠ Error processing {year}Q{quarter}: {str(e)}")
                 import traceback
                 traceback.print_exc()
     
-    # Combine all quarter CSV files into one exposures.csv
-    exposures_csv_path = output_path / 'exposures.csv'
-    if quarter_csv_files:
-        print(f"\n[3] Combining {len(quarter_csv_files)} quarter files into exposures.csv...")
-        exposure_chunks = []
-        for csv_file in quarter_csv_files:
-            chunk = pd.read_csv(csv_file)
-            exposure_chunks.append(chunk)
-        
-        combined_exposures = pd.concat(exposure_chunks, ignore_index=True)
-        # Sort by DATE, FACTSET_ID
-        combined_exposures['DATE'] = pd.to_datetime(combined_exposures['DATE'])
-        combined_exposures = combined_exposures.sort_values(['DATE', 'FACTSET_ID'])
-        
-        # Convert to long format (MODEL, DATE, SECURITY_ID, FACTOR_NAME, EXPOSURE)
-        from .model_builder import FactorModelBuilder
-        combined_exposures_long = FactorModelBuilder.convert_exposures_to_long_format(combined_exposures)
-        
-        # Sort by DATE, SECURITY_ID, FACTOR_NAME
-        combined_exposures_long = combined_exposures_long.sort_values(['DATE', 'SECURITY_ID', 'FACTOR_NAME'])
-        combined_exposures_long['DATE'] = pd.to_datetime(combined_exposures_long['DATE']).dt.strftime('%Y-%m-%d')
-        combined_exposures_long.to_csv(exposures_csv_path, index=False)
-        
-        print(f"   ✓ Combined and converted {len(combined_exposures_long):,} exposure rows (long format) → {exposures_csv_path}")
-        
-        # Clean up temporary quarter files
-        for csv_file in quarter_csv_files:
-            csv_file.unlink()
+    # All exposures are already written as date-partitioned Parquet files
+    exposures_parquet_dir = output_path / 'exposures'
     
     print(f"\n✓ Processed {processed_total} dates")
     print(f"  Skipped {skipped_total} dates")
+    print(f"  Exposures saved as date-partitioned Parquet: {exposures_parquet_dir}")
     
-    return {'processed': processed_total, 'skipped': skipped_total, 'exposures_csv': exposures_csv_path}
+    return {'processed': processed_total, 'skipped': skipped_total, 'exposures_parquet_dir': exposures_parquet_dir}
 
 
 if __name__ == "__main__":

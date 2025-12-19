@@ -232,54 +232,71 @@ def download_all_data(
             combined_prices = existing_prices
     
     # Step 2: Calculate and save returns
-    print(f"\n[2] Calculating returns for new data...")
+    print(f"\n[2] Calculating returns from prices...")
     if combined_prices is not None and len(combined_prices) > 0:
-        # Only calculate returns for new prices
-        if len(new_prices_df) > 0:
-            new_returns_df = retriever.calculate_returns_from_prices(new_prices_df)
+        # If returns.parquet doesn't exist, calculate from ALL prices
+        # Otherwise, only calculate returns for new prices
+        if existing_returns is None or not returns_path.exists():
+            print("   ℹ No existing returns file - calculating from all prices...")
+            returns_to_calculate = combined_prices
         else:
-            new_returns_df = pd.DataFrame()
-        
-        if len(new_returns_df) > 0:
-            if 'P_DATE' in new_returns_df.columns:
-                new_returns_df['DATE'] = pd.to_datetime(new_returns_df['P_DATE'])
-            elif 'DATE' in new_returns_df.columns:
-                new_returns_df['DATE'] = pd.to_datetime(new_returns_df['DATE'])
-            
-            print(f"   ✓ Calculated {len(new_returns_df):,} new return rows")
-            
-            # Merge with existing returns
-            if existing_returns is not None:
-                # Remove overlapping dates (use prices download range if returns were calculated from prices)
-                if prices_need_download:
-                    overlap_start = prices_download_start
-                    overlap_end = prices_download_end
-                else:
-                    overlap_start = returns_download_start
-                    overlap_end = returns_download_end
-                existing_returns = existing_returns[
-                    (existing_returns['DATE'] < overlap_start) | 
-                    (existing_returns['DATE'] > overlap_end)
-                ]
-                combined_returns = pd.concat([existing_returns, new_returns_df], ignore_index=True)
-                combined_returns = combined_returns.sort_values('DATE')
-                # Remove duplicates
-                date_col = 'P_DATE' if 'P_DATE' in combined_returns.columns else 'DATE'
-                id_col = 'FSYM_ID' if 'FSYM_ID' in combined_returns.columns else 'FACTSET_ID'
-                combined_returns = combined_returns.drop_duplicates(
-                    subset=[id_col, date_col], 
-                    keep='last'
-                )
-                print(f"   ✓ Combined: {len(combined_returns):,} total return rows")
+            # Only calculate returns for new prices
+            if len(new_prices_df) > 0:
+                returns_to_calculate = new_prices_df
             else:
-                combined_returns = new_returns_df
+                returns_to_calculate = pd.DataFrame()
+        
+        if len(returns_to_calculate) > 0:
+            new_returns_df = retriever.calculate_returns_from_prices(returns_to_calculate)
             
-            # Save combined returns
-            print("   Saving to Parquet...")
-            combined_returns.to_parquet(returns_path, index=False, compression='snappy')
-            print(f"   ✓ Saved to {returns_path}")
+            if len(new_returns_df) > 0:
+                if 'P_DATE' in new_returns_df.columns:
+                    new_returns_df['DATE'] = pd.to_datetime(new_returns_df['P_DATE'])
+                elif 'DATE' in new_returns_df.columns:
+                    new_returns_df['DATE'] = pd.to_datetime(new_returns_df['DATE'])
+                
+                if existing_returns is None or not returns_path.exists():
+                    print(f"   ✓ Calculated {len(new_returns_df):,} return rows from all prices")
+                    combined_returns = new_returns_df
+                else:
+                    print(f"   ✓ Calculated {len(new_returns_df):,} new return rows")
+                    
+                    # Merge with existing returns
+                    # Remove overlapping dates (use prices download range if returns were calculated from prices)
+                    if prices_need_download:
+                        overlap_start = prices_download_start
+                        overlap_end = prices_download_end
+                    else:
+                        overlap_start = returns_download_start
+                        overlap_end = returns_download_end
+                    existing_returns = existing_returns[
+                        (existing_returns['DATE'] < overlap_start) | 
+                        (existing_returns['DATE'] > overlap_end)
+                    ]
+                    combined_returns = pd.concat([existing_returns, new_returns_df], ignore_index=True)
+                    combined_returns = combined_returns.sort_values('DATE')
+                    # Remove duplicates
+                    date_col = 'P_DATE' if 'P_DATE' in combined_returns.columns else 'DATE'
+                    id_col = 'FSYM_ID' if 'FSYM_ID' in combined_returns.columns else 'FACTSET_ID'
+                    combined_returns = combined_returns.drop_duplicates(
+                        subset=[id_col, date_col], 
+                        keep='last'
+                    )
+                    print(f"   ✓ Combined: {len(combined_returns):,} total return rows")
+                
+                # Save combined returns
+                print("   Saving to Parquet...")
+                combined_returns.to_parquet(returns_path, index=False, compression='snappy')
+                print(f"   ✓ Saved to {returns_path}")
+            else:
+                print("   ⚠ No return data calculated")
         else:
-            print("   ⚠ No new return data calculated")
+            if existing_returns is not None:
+                print("   ✓ Using existing returns (no new prices to calculate from)")
+                combined_returns = existing_returns
+            else:
+                print("   ⚠ No prices available to calculate returns")
+                combined_returns = None
     
     # Step 3: Download fundamentals (in chunks for efficiency)
     fundamentals_path = data_path / 'fundamentals.parquet'

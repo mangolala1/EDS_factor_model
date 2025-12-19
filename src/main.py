@@ -1,16 +1,22 @@
 """
 Streamlined main workflow for EDS Factor Model
 1. Download all data from Snowflake (one-time) → Parquet files
-2. Process quarters in parallel → CSV files
+2. Process quarters in parallel → Parquet files (date-partitioned)
 3. Calculate factor returns, specific returns, risk, covariance → CSV files
 """
+import sys
+from pathlib import Path
+
+# Add project root to path for imports
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
 import pandas as pd
 from datetime import datetime
-from pathlib import Path
 from tqdm import tqdm
-from .quarter_processor import process_quarters_parallel
-from .model_builder import FactorModelBuilder
-from .data_retrieval import SnowflakeDataRetriever, get_date_range
+from src.quarter_processor import process_quarters_parallel
+from src.model_builder import FactorModelBuilder
+from src.data_retrieval import SnowflakeDataRetriever, get_date_range
 import time
 
 
@@ -79,9 +85,9 @@ def main(
         print("✗ ERROR: No dates were processed.")
         return None
     
-    exposures_csv_path = exposure_stats.get('exposures_csv')
-    if not exposures_csv_path or not Path(exposures_csv_path).exists():
-        print("✗ ERROR: Exposures CSV file not found.")
+    exposures_parquet_dir = exposure_stats.get('exposures_parquet_dir')
+    if not exposures_parquet_dir or not Path(exposures_parquet_dir).exists():
+        print("✗ ERROR: Exposures Parquet directory not found.")
         return None
     
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Stage 2 completed in {time.time() - stage2_start:.1f}s")
@@ -93,27 +99,45 @@ def main(
     stage3_start = time.time()
     
     try:
-        print("Loading exposures from CSV...")
+        print("Loading exposures from Parquet (date-partitioned, wide format)...")
         with tqdm(total=1, desc="Loading exposures", bar_format='{desc}: {elapsed}') as pbar:
-            exposures_long_df = pd.read_csv(exposures_csv_path)
-            exposures_long_df['DATE'] = pd.to_datetime(exposures_long_df['DATE'])
+            # Read all date partitions and combine
+            exposure_chunks = []
+            date_dirs = sorted([d for d in Path(exposures_parquet_dir).iterdir() if d.is_dir() and d.name.startswith('date=')])
             
-            # Convert long format to wide format for regression calculations
-            # Long format: MODEL, DATE, SECURITY_ID, FACTOR_NAME, EXPOSURE
-            # Wide format needed: index=(FACTSET_ID, DATE), columns=FACTOR_NAME
-            exposures_df = exposures_long_df.pivot_table(
-                index=['SECURITY_ID', 'DATE'],
-                columns='FACTOR_NAME',
-                values='EXPOSURE',
-                aggfunc='first'  # Should be unique, but use first if duplicates
-            )
-            exposures_df = exposures_df.rename_axis(None, axis=1)  # Remove FACTOR_NAME from column index name
-            exposures_df = exposures_df.rename_axis(['FACTSET_ID', 'DATE'])  # Set index names
+            for date_dir in date_dirs:
+                parquet_files = list(date_dir.glob('*.parquet'))
+                for parquet_file in parquet_files:
+                    chunk = pd.read_parquet(parquet_file)
+                    exposure_chunks.append(chunk)
+            
+            if not exposure_chunks:
+                raise ValueError("No exposure Parquet files found")
+            
+            # Combine all exposures
+            exposures_df = pd.concat(exposure_chunks, ignore_index=True)
+            
+            # Ensure DATE is datetime
+            exposures_df['DATE'] = pd.to_datetime(exposures_df['DATE'])
+            
+            # Set index to (FACTSET_ID, DATE) for regression calculations
+            if 'FACTSET_ID' in exposures_df.columns:
+                exposures_df = exposures_df.set_index(['FACTSET_ID', 'DATE'])
+            elif 'SECURITY_ID' in exposures_df.columns:
+                exposures_df = exposures_df.rename(columns={'SECURITY_ID': 'FACTSET_ID'})
+                exposures_df = exposures_df.set_index(['FACTSET_ID', 'DATE'])
+            else:
+                raise ValueError("Exposures DataFrame must have FACTSET_ID or SECURITY_ID column")
+            
+            # Remove MODEL column if present (not needed for calculations)
+            if 'MODEL' in exposures_df.columns:
+                exposures_df = exposures_df.drop(columns=['MODEL'])
+            
             pbar.update(1)
         
-        print(f"   ✓ Loaded {len(exposures_long_df):,} exposure observations (long format), converted to wide for calculations")
-        print(f"   ✓ Unique securities in exposures: {exposures_long_df['SECURITY_ID'].nunique():,}")
-        print(f"   ✓ Unique dates in exposures: {exposures_long_df['DATE'].nunique():,}")
+        print(f"   ✓ Loaded {len(exposures_df):,} exposure rows (wide format)")
+        print(f"   ✓ Unique securities: {exposures_df.index.get_level_values('FACTSET_ID').nunique():,}")
+        print(f"   ✓ Unique dates: {exposures_df.index.get_level_values('DATE').nunique():,}")
         
         # Load returns from Parquet (fast!)
         print("Loading returns from Parquet...")
@@ -257,20 +281,19 @@ def main(
     stage7_start = time.time()
     
     try:
-        # Load exposures in long format for factor name extraction
-        exposures_for_names = pd.read_csv(exposures_csv_path)
+        # Load exposures from Parquet (already in wide format)
+        # Read just one date partition to get factor names (they're the same across dates)
+        date_dirs = sorted([d for d in Path(exposures_parquet_dir).iterdir() if d.is_dir() and d.name.startswith('date=')])
+        if not date_dirs:
+            raise ValueError("No exposure date partitions found")
         
-        # Convert long format to wide format temporarily to extract factor names
-        if 'FACTOR_NAME' in exposures_for_names.columns:
-            # Already in long format, convert to wide
-            exposures_wide_for_names = exposures_for_names.pivot_table(
-                index=['SECURITY_ID', 'DATE'],
-                columns='FACTOR_NAME',
-                values='EXPOSURE',
-                aggfunc='first'
-            ).reset_index()
-        else:
-            exposures_wide_for_names = exposures_for_names
+        # Read first date partition to get factor names
+        first_parquet = list(date_dirs[0].glob('*.parquet'))[0]
+        exposures_wide_for_names = pd.read_parquet(first_parquet)
+        
+        # Reset index if needed
+        if isinstance(exposures_wide_for_names.index, pd.MultiIndex):
+            exposures_wide_for_names = exposures_wide_for_names.reset_index()
         
         # Generate factor names table
         with tqdm(total=1, desc="Factor names", bar_format='{desc}: {elapsed}') as pbar:
@@ -299,7 +322,7 @@ def main(
     print(f"✓ Processed {exposure_stats['processed']} dates")
     print(f"✓ All results saved to CSV files in: {output_dir}/")
     print("\nOutput CSV files:")
-    print(f"  - {output_path / 'exposures.csv'} (long format: MODEL, DATE, SECURITY_ID, FACTOR_NAME, EXPOSURE)")
+    print(f"  - {exposures_parquet_dir} (date-partitioned Parquet, wide format: FACTSET_ID, DATE, factor columns)")
     if factor_returns_df is not None:
         print(f"  - {output_path / 'factor_returns.csv'} (MODEL, DATE, FACTOR_NAME, RETURN)")
     if specific_returns_df is not None:
