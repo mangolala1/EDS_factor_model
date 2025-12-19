@@ -725,13 +725,29 @@ def compute_exposures_for_quarter(
             # Now convert to NumPy array - should be float64 with NaN for missing values
             char_data = char_df.values.astype(np.float64)  # (N stocks × K chars)
             
-            # Compute percentiles across axis=0 (across stocks for each characteristic)
-            # This is much faster than pandas quantile in a loop
-            lower_bounds = np.nanpercentile(char_data, winsorize_lower * 100, axis=0)
-            upper_bounds = np.nanpercentile(char_data, winsorize_upper * 100, axis=0)
+            # OPTIMIZATION: Column-level guard for winsorization to avoid NaN warnings
+            # Compute percentiles column by column, handling empty/NaN columns gracefully
+            lower_bounds = np.zeros(char_data.shape[1], dtype=np.float64)
+            upper_bounds = np.zeros(char_data.shape[1], dtype=np.float64)
+            
+            for col_idx in range(char_data.shape[1]):
+                col_data = char_data[:, col_idx]
+                valid_mask = np.isfinite(col_data)
+                valid_count = valid_mask.sum()
+                
+                if valid_count >= 2:  # Need at least 2 samples for percentile calculation
+                    # Calculate percentiles only on valid values
+                    valid_data = col_data[valid_mask]
+                    lower_bounds[col_idx] = np.percentile(valid_data, winsorize_lower * 100)
+                    upper_bounds[col_idx] = np.percentile(valid_data, winsorize_upper * 100)
+                else:
+                    # No valid values or only one: set bounds to NaN (will preserve NaN in clip)
+                    lower_bounds[col_idx] = np.nan
+                    upper_bounds[col_idx] = np.nan
             
             # Clip in one pass (vectorized) - broadcast lower/upper bounds to match char_data shape
             # np.clip broadcasts automatically: (N, K) clipped by (K,) bounds
+            # For columns with NaN bounds, np.clip will preserve NaN values
             char_data_clipped = np.clip(char_data, lower_bounds, upper_bounds)
             
             # Standardize in one pass (vectorized) - compute mean/std across stocks (axis=0)
@@ -777,11 +793,16 @@ def compute_exposures_for_quarter(
             for char in value_signals:
                 # Ensure numeric type (handles None values)
                 df_T[char] = pd.to_numeric(df_T[char], errors='coerce')
-                if df_T[char].notna().sum() > 0:
-                    char_values = df_T[char].values.astype(np.float64)
-                    lower = np.nanpercentile(char_values, winsorize_lower * 100)
-                    upper = np.nanpercentile(char_values, winsorize_upper * 100)
+                char_values = df_T[char].values.astype(np.float64)
+                valid_mask = np.isfinite(char_values)
+                valid_count = valid_mask.sum()
+                
+                if valid_count >= 2:  # Need at least 2 samples for percentile
+                    valid_data = char_values[valid_mask]
+                    lower = np.percentile(valid_data, winsorize_lower * 100)
+                    upper = np.percentile(valid_data, winsorize_upper * 100)
                     df_T[char] = np.clip(char_values, lower, upper)
+                # If valid_count < 2, leave as is (NaN values preserved)
             
             # Z-score each value signal separately
             value_z_scores_df = pd.DataFrame(index=df_T.index)
@@ -816,11 +837,16 @@ def compute_exposures_for_quarter(
             for char in profitability_signals:
                 # Ensure numeric type (handles None values)
                 df_T[char] = pd.to_numeric(df_T[char], errors='coerce')
-                if df_T[char].notna().sum() > 0:
-                    char_values = df_T[char].values.astype(np.float64)
-                    lower = np.nanpercentile(char_values, winsorize_lower * 100)
-                    upper = np.nanpercentile(char_values, winsorize_upper * 100)
+                char_values = df_T[char].values.astype(np.float64)
+                valid_mask = np.isfinite(char_values)
+                valid_count = valid_mask.sum()
+                
+                if valid_count >= 2:  # Need at least 2 samples for percentile
+                    valid_data = char_values[valid_mask]
+                    lower = np.percentile(valid_data, winsorize_lower * 100)
+                    upper = np.percentile(valid_data, winsorize_upper * 100)
                     df_T[char] = np.clip(char_values, lower, upper)
+                # If valid_count < 2, leave as is (NaN values preserved)
             
             # Z-score each profitability signal separately
             profitability_z_scores_df = pd.DataFrame(index=df_T.index)
@@ -855,11 +881,16 @@ def compute_exposures_for_quarter(
             for char in growth_signals:
                 # Ensure numeric type (handles None values)
                 df_T[char] = pd.to_numeric(df_T[char], errors='coerce')
-                if df_T[char].notna().sum() > 0:
-                    char_values = df_T[char].values.astype(np.float64)
-                    lower = np.nanpercentile(char_values, winsorize_lower * 100)
-                    upper = np.nanpercentile(char_values, winsorize_upper * 100)
+                char_values = df_T[char].values.astype(np.float64)
+                valid_mask = np.isfinite(char_values)
+                valid_count = valid_mask.sum()
+                
+                if valid_count >= 2:  # Need at least 2 samples for percentile
+                    valid_data = char_values[valid_mask]
+                    lower = np.percentile(valid_data, winsorize_lower * 100)
+                    upper = np.percentile(valid_data, winsorize_upper * 100)
                     df_T[char] = np.clip(char_values, lower, upper)
+                # If valid_count < 2, leave as is (NaN values preserved)
             
             # Z-score each growth signal separately
             growth_z_scores_df = pd.DataFrame(index=df_T.index)
